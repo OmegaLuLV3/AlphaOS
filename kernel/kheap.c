@@ -25,7 +25,7 @@ static u32 heap_used_bytes;
 
 void kheap_init(void)
 {
-    u32 base = pmm_alloc_contig(HEAP_SIZE / PAGE_SIZE);
+    uptr base = pmm_alloc_contig(HEAP_SIZE / PAGE_SIZE);
     if (!base)
         panic("kheap: cannot allocate heap region");
 

@@ -16,7 +16,7 @@ static inline void bm_set(u32 f)   { bitmap[f / 32] |=  (1u << (f % 32)); }
 static inline void bm_clear(u32 f) { bitmap[f / 32] &= ~(1u << (f % 32)); }
 static inline int  bm_test(u32 f)  { return bitmap[f / 32] & (1u << (f % 32)); }
 
-void pmm_reserve(u32 start, u32 end)
+void pmm_reserve(uptr start, uptr end)
 {
     u32 f = PAGE_ALIGN_DOWN(start) / PAGE_SIZE;
     u32 fe = PAGE_ALIGN_UP(end) / PAGE_SIZE;
@@ -28,7 +28,7 @@ void pmm_reserve(u32 start, u32 end)
     }
 }
 
-void pmm_init(multiboot_info_t *mbi, u32 kernel_end)
+void pmm_init(multiboot_info_t *mbi, uptr kernel_end)
 {
     if (!(mbi->flags & MB_FLAG_MEM))
         panic("bootloader did not provide memory info");
@@ -39,34 +39,35 @@ void pmm_init(multiboot_info_t *mbi, u32 kernel_end)
     total_frames = total_bytes / PAGE_SIZE;
 
     /* everything below the kernel's end is off-limits:
-       real-mode IVT, BIOS data, VGA memory, and the kernel image */
+       real-mode IVT, BIOS data, VGA memory, the kernel image, and the
+       temporary boot-time page tables/stack (also part of .bss) */
     pmm_reserve(0, kernel_end);
 
     /* reserve the multiboot info block and any modules (initrd) */
-    pmm_reserve((u32)mbi, (u32)mbi + sizeof(*mbi));
+    pmm_reserve((uptr)mbi, (uptr)mbi + sizeof(*mbi));
     if (mbi->flags & MB_FLAG_MODS) {
-        multiboot_module_t *mods = (multiboot_module_t *)mbi->mods_addr;
+        multiboot_module_t *mods = (multiboot_module_t *)(uptr)mbi->mods_addr;
         pmm_reserve(mbi->mods_addr,
-                    mbi->mods_addr + mbi->mods_count * sizeof(*mods));
+                    (uptr)mbi->mods_addr + mbi->mods_count * sizeof(*mods));
         for (u32 i = 0; i < mbi->mods_count; i++)
             pmm_reserve(mods[i].mod_start, mods[i].mod_end);
     }
 }
 
-u32 pmm_alloc_frame(void)
+uptr pmm_alloc_frame(void)
 {
     for (u32 f = search_hint; f < total_frames; f++) {
         if (!bm_test(f)) {
             bm_set(f);
             used_frames++;
             search_hint = f + 1;
-            return f * PAGE_SIZE;
+            return (uptr)f * PAGE_SIZE;
         }
     }
     return 0;
 }
 
-u32 pmm_alloc_contig(u32 n)
+uptr pmm_alloc_contig(u32 n)
 {
     u32 run = 0;
     for (u32 f = 0; f < total_frames; f++) {
@@ -76,13 +77,13 @@ u32 pmm_alloc_contig(u32 n)
             for (u32 i = start; i <= f; i++)
                 bm_set(i);
             used_frames += n;
-            return start * PAGE_SIZE;
+            return (uptr)start * PAGE_SIZE;
         }
     }
     return 0;
 }
 
-void pmm_free_frame(u32 addr)
+void pmm_free_frame(uptr addr)
 {
     u32 f = addr / PAGE_SIZE;
     if (f >= total_frames || !bm_test(f))
@@ -93,6 +94,6 @@ void pmm_free_frame(u32 addr)
         search_hint = f;
 }
 
-u32 pmm_total_kib(void)   { return total_frames * (PAGE_SIZE / 1024); }
-u32 pmm_free_kib(void)    { return (total_frames - used_frames) * (PAGE_SIZE / 1024); }
-u32 pmm_managed_end(void) { return total_frames * PAGE_SIZE; }
+u32  pmm_total_kib(void)   { return total_frames * (PAGE_SIZE / 1024); }
+u32  pmm_free_kib(void)    { return (total_frames - used_frames) * (PAGE_SIZE / 1024); }
+uptr pmm_managed_end(void) { return (uptr)total_frames * PAGE_SIZE; }

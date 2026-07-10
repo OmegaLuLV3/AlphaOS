@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """
 mkimports.py — generate the IAT + call trampolines for Windows-style
-AlphaOS apps from an import manifest.
+AlphaOS (x86-64) apps from an import manifest.
 
 Emits an assembly file with:
-  .iat  — one 4-byte slot per import (per DLL, zero-terminated), the
-          exact layout tools/mkpe.py describes in the PE import
-          directory; the loader patches these slots at exec time.
-  .text — `Func: jmp *__imp_Func` trampolines so C code can call the
-          imports as ordinary functions (stdcall passes through jmp).
+  .iat  — one 8-byte slot per import (IMAGE_THUNK_DATA64, per DLL,
+          zero-terminated), the exact layout tools/mkpe.py describes
+          in the PE import directory; the loader patches these slots
+          at exec time.
+  .text — `Func: jmp *__imp_Func(%rip)` trampolines so C code can call
+          the imports as ordinary functions. RIP-relative addressing
+          is used because x86-64 has no encoding for a bare absolute
+          memory operand in non-PIC code the way i386 did; the
+          trampoline is otherwise still just a tail jump — it doesn't
+          touch any registers, so it preserves whatever calling
+          convention the caller used (the real Microsoft x64 ABI).
 
 usage: mkimports.py <imports.list> <out.S>
 """
@@ -37,14 +43,14 @@ def main():
     for dll, funcs in dlls:
         out.append(f"/* {dll} */")
         for fn in funcs:
-            out.append(f"__imp_{fn}: .long 0")
-        out.append(".long 0")
+            out.append(f"__imp_{fn}: .quad 0")
+        out.append(".quad 0")
     out.append("")
     out.append(".section .text")
     for _, funcs in dlls:
         for fn in funcs:
             out.append(f".global {fn}")
-            out.append(f"{fn}: jmp *__imp_{fn}")
+            out.append(f"{fn}: jmp *__imp_{fn}(%rip)")
     out.append("")
     out.append('.section .note.GNU-stack, "", @progbits')
 

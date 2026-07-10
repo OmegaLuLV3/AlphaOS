@@ -1,4 +1,11 @@
-/* Interrupt and exception stubs. All funnel into isr_common -> C. */
+/*
+ * Interrupt and exception stubs, 64-bit. x86-64 has no pusha/popa, so
+ * the register save is done by hand; the layout here must match
+ * regs_t in kernel.h exactly. In long mode the CPU always pushes
+ * SS:RSP as part of the interrupt frame (unlike 32-bit protected mode,
+ * where that only happens on a privilege change), so the frame is a
+ * fixed 5 qwords: RIP, CS, RFLAGS, RSP, SS.
+ */
 
 .section .text
 
@@ -76,19 +83,41 @@ IRQ 14, 46
 IRQ 15, 47
 
 isr_common:
-    pusha
-    push %ds
-    mov $0x10, %ax
-    mov %ax, %ds
-    mov %ax, %es
-    push %esp                /* pointer to regs_t */
+    push %rax
+    push %rbx
+    push %rcx
+    push %rdx
+    push %rsi
+    push %rdi
+    push %rbp
+    push %r8
+    push %r9
+    push %r10
+    push %r11
+    push %r12
+    push %r13
+    push %r14
+    push %r15
+
+    mov %rsp, %rdi            /* arg0: regs_t * (System V: rdi) */
     call interrupt_dispatch
-    add $4, %esp
-    pop %eax
-    mov %ax, %ds
-    mov %ax, %es
-    popa
-    add $8, %esp             /* error code + int number */
-    iret
+
+    pop %r15
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %r11
+    pop %r10
+    pop %r9
+    pop %r8
+    pop %rbp
+    pop %rdi
+    pop %rsi
+    pop %rdx
+    pop %rcx
+    pop %rbx
+    pop %rax
+    add $16, %rsp              /* discard int_no + err_code */
+    iretq
 
 .section .note.GNU-stack, "", @progbits

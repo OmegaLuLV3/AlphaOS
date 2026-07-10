@@ -27,8 +27,8 @@ void ramdisk_init(multiboot_info_t *mbi)
         return;
     }
 
-    multiboot_module_t *mod = (multiboot_module_t *)mbi->mods_addr;
-    const u8 *base = (const u8 *)mod->mod_start;
+    multiboot_module_t *mod = (multiboot_module_t *)(uptr)mbi->mods_addr;
+    const u8 *base = (const u8 *)(uptr)mod->mod_start;
     u32 mod_size = mod->mod_end - mod->mod_start;
 
     if (mod_size < 8 || memcmp(base, "ARFS", 4) != 0) {

@@ -46,7 +46,7 @@ int bga_init(int w, int h)
         kprint("bga: adapter found but no framebuffer BAR\n");
         return -1;
     }
-    u32 fb_phys = dev->bar0 & 0xFFFFFFF0u;
+    uptr fb_phys = dev->bar0 & 0xFFFFFFF0u;
 
     vbe_write(VBE_ENABLE, 0);
     vbe_write(VBE_XRES, w);
@@ -67,7 +67,7 @@ int bga_init(int w, int h)
     scr_w = w;
     scr_h = h;
     kprintf("bga: %dx%dx32 framebuffer at %p (dispi id 0x%x)\n",
-            w, h, fb_phys, id);
+            w, h, (void *)fb_phys, id);
     return 0;
 }
 

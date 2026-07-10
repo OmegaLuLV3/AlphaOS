@@ -12,11 +12,24 @@ PYTHON  := python3
 
 BUILD := build
 
-CFLAGS := -m32 -ffreestanding -fno-pic -fno-stack-protector \
-          -fno-asynchronous-unwind-tables -nostdlib -O2 -Wall -Wextra \
-          -fno-strict-aliasing
-ASFLAGS := -m32
-KLDFLAGS := -m elf_i386 -T kernel/linker.ld -nostdlib
+# -mno-red-zone is mandatory: interrupts run on the SAME stack as
+# whatever they preempted (no IST/TSS stack switch), so any C code
+# that might be interrupted with hardware IRQs enabled — which is
+# everything, kernel and apps alike, once kmain calls sti() — must not
+# rely on the System V red zone, or an ISR's own stack pushes would
+# corrupt it out from under the interrupted function.
+#
+# -mgeneral-regs-only is also mandatory: without it GCC will happily
+# use SSE registers/instructions for ordinary struct zeroing or copies
+# (e.g. `pxor %xmm0,%xmm0`), but we never set CR0/CR4 to enable SSE and
+# never save/restore FPU/SSE state across process switches — so any
+# such instruction raises #UD (invalid opcode). Restricting codegen to
+# general-purpose registers sidesteps needing any of that machinery.
+CFLAGS := -m64 -mno-red-zone -mgeneral-regs-only -ffreestanding -fno-pic \
+          -fno-stack-protector -fno-asynchronous-unwind-tables -nostdlib \
+          -O2 -Wall -Wextra -fno-strict-aliasing
+ASFLAGS := -m64
+KLDFLAGS := -m elf_x86_64 -T kernel/linker.ld -nostdlib
 
 # ---- kernel ---------------------------------------------------------
 
@@ -38,7 +51,7 @@ IMPORTS  := apps/win32/imports.list
 
 .PHONY: all run run-vga test clean
 
-all: $(BUILD)/kernel.elf $(BUILD)/initrd.img
+all: $(BUILD)/kernel.elf $(BUILD)/initrd.img $(BUILD)/alphaos.iso
 
 $(BUILD)/kernel $(BUILD)/apps:
 	mkdir -p $@
@@ -61,7 +74,7 @@ $(BUILD)/apps/%.o: apps/%.c apps/alpha.h include/alpha_api.h | $(BUILD)/apps
 	$(CC) $(CFLAGS) -c $< -o $@
 
 $(BUILD)/apps/%.elf: $(BUILD)/apps/%.o $(BUILD)/apps/crt0.o apps/app.ld
-	$(LD) -m elf_i386 -T apps/app.ld -nostdlib -o $@ \
+	$(LD) -m elf_x86_64 -T apps/app.ld -nostdlib -o $@ \
 	    $(BUILD)/apps/crt0.o $<
 
 $(BUILD)/apps/%.exe: $(BUILD)/apps/%.elf tools/mkpe.py
@@ -85,7 +98,7 @@ $(BUILD)/apps/%.wo: apps/win32/%.c apps/win32/win32.h | $(BUILD)/apps
 
 $(BUILD)/apps/%.winelf: $(BUILD)/apps/%.wo $(BUILD)/apps/wincrt0.o \
                         $(BUILD)/apps/imports.o apps/win32/winapp.ld
-	$(LD) -m elf_i386 -T apps/win32/winapp.ld -nostdlib -o $@ \
+	$(LD) -m elf_x86_64 -T apps/win32/winapp.ld -nostdlib -o $@ \
 	    $(BUILD)/apps/wincrt0.o $(BUILD)/apps/imports.o $<
 
 $(WIN_EXES): $(BUILD)/apps/%.exe: $(BUILD)/apps/%.winelf tools/mkpe.py \
@@ -98,10 +111,24 @@ $(WIN_EXES): $(BUILD)/apps/%.exe: $(BUILD)/apps/%.winelf tools/mkpe.py \
 $(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) tools/mkinitrd.py
 	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES)
 
+# ---- bootable ISO -----------------------------------------------------
+#
+# QEMU's own built-in multiboot loader (-kernel) only accepts 32-bit
+# ELF kernels; an ELF64 kernel needs a real bootloader. GRUB2's
+# multiboot loader is more capable — it loads a 64-bit ELF via a plain
+# Multiboot 1 header just fine — so we boot through a GRUB2 rescue ISO
+# instead of -kernel directly.
+
+$(BUILD)/alphaos.iso: $(BUILD)/kernel.elf $(BUILD)/initrd.img boot/grub.cfg
+	mkdir -p $(BUILD)/iso/boot/grub
+	cp $(BUILD)/kernel.elf $(BUILD)/iso/boot/kernel.elf
+	cp $(BUILD)/initrd.img $(BUILD)/iso/boot/initrd.img
+	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
+	grub-mkrescue -o $@ $(BUILD)/iso
+
 # ---- run / test -----------------------------------------------------
 
-QEMU := qemu-system-i386 -m 128 -vga std -kernel $(BUILD)/kernel.elf \
-        -initrd $(BUILD)/initrd.img
+QEMU := qemu-system-x86_64 -m 128 -vga std -cdrom $(BUILD)/alphaos.iso
 
 run: all
 	$(QEMU) -nographic

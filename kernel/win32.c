@@ -4,13 +4,18 @@
  * USER32.DLL through their PE import table, and the loader patches
  * their IAT to point directly at these functions.
  *
- * All functions use the stdcall convention, exactly like real Win32,
- * so binaries built by a Windows toolchain against this subset (with
- * no CRT) run unmodified.
+ * All functions use the Microsoft x64 calling convention (ms_abi:
+ * first four integer/pointer args in RCX, RDX, R8, R9; caller reserves
+ * 32 bytes of shadow space; callee doesn't clean the stack) — exactly
+ * what real 64-bit Windows uses, and what GCC's `ms_abi` attribute
+ * generates. A PE32+ binary built by a real Windows toolchain against
+ * this subset (no CRT) runs unmodified, because the IAT trampoline is
+ * just a `jmp` — it doesn't touch registers, so caller and callee only
+ * need to agree on the convention, which they do here.
  */
 #include "kernel.h"
 
-#define WINAPI __attribute__((stdcall))
+#define WINAPI __attribute__((ms_abi))
 
 /* ---- KERNEL32 -------------------------------------------------------- */
 
@@ -27,17 +32,17 @@ static void WINAPI w_ExitProcess(u32 code)
     panic("ExitProcess with no process running");
 }
 
-static u32 WINAPI w_GetStdHandle(u32 which)
+static void *WINAPI w_GetStdHandle(u32 which)
 {
     switch (which) {
-    case STD_INPUT_HANDLE:  return 0x10;
-    case STD_OUTPUT_HANDLE: return 0x11;
-    case STD_ERROR_HANDLE:  return 0x12;
+    case STD_INPUT_HANDLE:  return (void *)0x10;
+    case STD_OUTPUT_HANDLE: return (void *)0x11;
+    case STD_ERROR_HANDLE:  return (void *)0x12;
     }
-    return (u32)-1;
+    return (void *)(uptr)-1;
 }
 
-static int WINAPI w_WriteConsoleA(u32 handle, const void *buf, u32 len,
+static int WINAPI w_WriteConsoleA(void *handle, const void *buf, u32 len,
                                   u32 *written, void *reserved)
 {
     (void)handle;
@@ -51,13 +56,13 @@ static int WINAPI w_WriteConsoleA(u32 handle, const void *buf, u32 len,
     return 1;
 }
 
-static int WINAPI w_WriteFile(u32 handle, const void *buf, u32 len,
+static int WINAPI w_WriteFile(void *handle, const void *buf, u32 len,
                               u32 *written, void *overlapped)
 {
     return w_WriteConsoleA(handle, buf, len, written, overlapped);
 }
 
-static int WINAPI w_ReadConsoleA(u32 handle, void *buf, u32 max,
+static int WINAPI w_ReadConsoleA(void *handle, void *buf, u32 max,
                                  u32 *read, void *reserved)
 {
     (void)handle;
@@ -83,39 +88,39 @@ static u32 WINAPI w_GetTickCount(void)
     return uptime_ms();
 }
 
-static void *WINAPI w_VirtualAlloc(void *addr, u32 size, u32 type, u32 prot)
+static void *WINAPI w_VirtualAlloc(void *addr, u64 size, u32 type, u32 prot)
 {
     (void)addr;
     (void)type;
     (void)prot;
-    void *p = proc_alloc(size);
+    void *p = proc_alloc((u32)size);
     if (p)
-        memset(p, 0, size); /* VirtualAlloc returns zeroed pages */
+        memset(p, 0, (u32)size); /* VirtualAlloc returns zeroed pages */
     return p;
 }
 
-static int WINAPI w_VirtualFree(void *addr, u32 size, u32 type)
+static int WINAPI w_VirtualFree(void *addr, u64 size, u32 type)
 {
     (void)size;
     (void)type;
     return proc_free(addr);
 }
 
-static u32 WINAPI w_GetProcessHeap(void)
+static void *WINAPI w_GetProcessHeap(void)
 {
-    return 0xA1FA;
+    return (void *)0xA1FA;
 }
 
-static void *WINAPI w_HeapAlloc(u32 heap, u32 flags, u32 size)
+static void *WINAPI w_HeapAlloc(void *heap, u32 flags, u64 size)
 {
     (void)heap;
-    void *p = proc_alloc(size);
+    void *p = proc_alloc((u32)size);
     if (p && (flags & 0x08)) /* HEAP_ZERO_MEMORY */
-        memset(p, 0, size);
+        memset(p, 0, (u32)size);
     return p;
 }
 
-static int WINAPI w_HeapFree(u32 heap, u32 flags, void *ptr)
+static int WINAPI w_HeapFree(void *heap, u32 flags, void *ptr)
 {
     (void)heap;
     (void)flags;
@@ -148,7 +153,7 @@ static int WINAPI w_lstrlenA(const char *s)
 
 #define MB_MAX_LINES 8
 
-static int WINAPI w_MessageBoxA(u32 hwnd, const char *text,
+static int WINAPI w_MessageBoxA(void *hwnd, const char *text,
                                 const char *caption, u32 type)
 {
     (void)hwnd;
@@ -313,12 +318,12 @@ void *win_resolve(const char *dll, const char *func)
     return NULL;
 }
 
-static u32 WINAPI w_LoadLibraryA(const char *name)
+static void *WINAPI w_LoadLibraryA(const char *name)
 {
-    return (u32)find_module(name ? name : "");
+    return find_module(name ? name : "");
 }
 
-static void *WINAPI w_GetProcAddress(u32 module, const char *name)
+static void *WINAPI w_GetProcAddress(void *module, const char *name)
 {
     win_module_t *m = (win_module_t *)module;
     if (!m || !name)
@@ -339,6 +344,6 @@ void win32_init(void)
         else if (strcmp(e->name, "GetProcAddress") == 0)
             e->fn = (void *)w_GetProcAddress;
     }
-    kprintf("win32: %u exports in kernel32.dll, %u in user32.dll\n",
+    kprintf("win32: %u exports in kernel32.dll, %u in user32.dll (x64 ABI)\n",
             modules[0].count, modules[1].count);
 }

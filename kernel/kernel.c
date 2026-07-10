@@ -16,7 +16,7 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     pit_init(100);
     keyboard_init();
 
-    pmm_init(mbi, (u32)&kernel_end);
+    pmm_init(mbi, (uptr)&kernel_end);
     paging_init();
     kheap_init();
     ramdisk_init(mbi);
@@ -35,7 +35,7 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     sti();
 
     console_set_color(ALPHA_LCYAN, ALPHA_BLACK);
-    kprint("\n  AlphaOS 0.3 -- a lightweight OS that runs .exe files\n");
+    kprint("\n  AlphaOS 0.4 -- a lightweight OS that runs .exe files\n");
     console_set_color(ALPHA_DGREY, ALPHA_BLACK);
     kprintf("  %u KiB RAM managed | %u KiB in use | %u file(s) on ramdisk\n",
             pmm_total_kib(), pmm_total_kib() - pmm_free_kib(),

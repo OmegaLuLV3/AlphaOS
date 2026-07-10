@@ -74,10 +74,10 @@ void gdt_init(void);
 void idt_init(void);
 
 typedef struct regs {
-    u32 ds;
-    u32 edi, esi, ebp, esp_dummy, ebx, edx, ecx, eax;
-    u32 int_no, err_code;
-    u32 eip, cs, eflags;
+    u64 r15, r14, r13, r12, r11, r10, r9, r8;
+    u64 rbp, rdi, rsi, rdx, rcx, rbx, rax;
+    u64 int_no, err_code;
+    u64 rip, cs, rflags, rsp, ss;
 } regs_t;
 
 typedef void (*irq_handler_t)(regs_t *);
@@ -153,19 +153,19 @@ void gfx_circle(surface_t *s, int cx, int cy, int r, u32 c);
 void gfx_blit(surface_t *dst, int dx, int dy, const surface_t *src);
 
 /* ---- pmm.c --------------------------------------------------------- */
-void pmm_init(multiboot_info_t *mbi, u32 kernel_end);
-void pmm_reserve(u32 start, u32 end);
-u32  pmm_alloc_frame(void);             /* returns phys addr or 0 */
-u32  pmm_alloc_contig(u32 nframes);
-void pmm_free_frame(u32 addr);
+void pmm_init(multiboot_info_t *mbi, uptr kernel_end);
+void pmm_reserve(uptr start, uptr end);
+uptr pmm_alloc_frame(void);             /* returns phys addr or 0 */
+uptr pmm_alloc_contig(u32 nframes);
+void pmm_free_frame(uptr addr);
 u32  pmm_total_kib(void);
 u32  pmm_free_kib(void);
-u32  pmm_managed_end(void);
+uptr pmm_managed_end(void);
 
 /* ---- paging.c ------------------------------------------------------ */
 void paging_init(void);
-int  paging_map(u32 virt, u32 phys, int writable);
-void paging_unmap(u32 virt);
+int  paging_map(uptr virt, uptr phys, int writable);
+void paging_unmap(uptr virt);
 void tlb_flush(void);
 
 /* ---- kheap.c ------------------------------------------------------- */
@@ -187,7 +187,7 @@ rd_file_t *ramdisk_get(u32 index);
 rd_file_t *ramdisk_find(const char *name);
 
 /* ---- process / PE loader ------------------------------------------- */
-typedef u32 jmp_buf_t[6];
+typedef u64 jmp_buf_t[8];
 int  k_setjmp(jmp_buf_t buf);
 void k_longjmp(jmp_buf_t buf, int val) __attribute__((noreturn));
 
@@ -197,7 +197,7 @@ typedef struct process {
     jmp_buf_t   exit_jmp;
     int         exit_code;
     struct alloc_node *allocs;   /* tracked heap allocations */
-    u32         image_base;
+    uptr        image_base;
     u32         image_pages;
     u32         heap_bytes;      /* live tracked bytes */
     char        cmdline[128];    /* for GetCommandLineA */

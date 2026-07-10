@@ -1,14 +1,16 @@
 /*
  * Win32 API subset implemented by AlphaOS. Signatures and constants
- * match the real windows.h (stdcall, same argument layout), so code
- * written against this header also compiles with a Windows toolchain.
+ * match the real windows.h, using the real Microsoft x64 calling
+ * convention (ms_abi), so code written against this header also
+ * compiles with a Windows toolchain (MinGW, -nostdlib) unmodified.
  */
 #ifndef ALPHA_WIN32_H
 #define ALPHA_WIN32_H
 
-#define WINAPI __attribute__((stdcall))
+#define WINAPI __attribute__((ms_abi))
 
 typedef unsigned int   DWORD;
+typedef unsigned long  SIZE_T;   /* 8 bytes on x64, matches real Windows */
 typedef int            BOOL;
 typedef unsigned int   UINT;
 typedef void          *HANDLE;
@@ -49,11 +51,11 @@ BOOL    WINAPI ReadConsoleA(HANDLE h, LPVOID buf, DWORD max,
                             LPDWORD read, LPVOID reserved);
 void    WINAPI Sleep(DWORD ms);
 DWORD   WINAPI GetTickCount(void);
-LPVOID  WINAPI VirtualAlloc(LPVOID addr, DWORD size, DWORD type,
+LPVOID  WINAPI VirtualAlloc(LPVOID addr, SIZE_T size, DWORD type,
                             DWORD protect);
-BOOL    WINAPI VirtualFree(LPVOID addr, DWORD size, DWORD type);
+BOOL    WINAPI VirtualFree(LPVOID addr, SIZE_T size, DWORD type);
 HANDLE  WINAPI GetProcessHeap(void);
-LPVOID  WINAPI HeapAlloc(HANDLE heap, DWORD flags, DWORD size);
+LPVOID  WINAPI HeapAlloc(HANDLE heap, DWORD flags, SIZE_T size);
 BOOL    WINAPI HeapFree(HANDLE heap, DWORD flags, LPVOID ptr);
 LPSTR   WINAPI GetCommandLineA(void);
 DWORD   WINAPI GetLastError(void);

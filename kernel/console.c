@@ -131,6 +131,23 @@ static void print_uint(u32 v, u32 base, int width, char pad)
         kputc(buf[i]);
 }
 
+static void print_uint64(u64 v, u32 base, int width, char pad)
+{
+    static const char digits[] = "0123456789abcdef";
+    char buf[20];
+    int i = 0;
+    if (v == 0)
+        buf[i++] = '0';
+    while (v) {
+        buf[i++] = digits[v % base];
+        v /= base;
+    }
+    while (i < width && i < (int)sizeof(buf))
+        buf[i++] = pad;
+    while (i--)
+        kputc(buf[i]);
+}
+
 void kprintf(const char *fmt, ...)
 {
     __builtin_va_list ap;
@@ -178,7 +195,7 @@ void kprintf(const char *fmt, ...)
             break;
         case 'p':
             kprint("0x");
-            print_uint(__builtin_va_arg(ap, u32), 16, 8, '0');
+            print_uint64((uptr)__builtin_va_arg(ap, void *), 16, 8, '0');
             break;
         case '%':
             kputc('%');

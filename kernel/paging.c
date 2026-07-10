@@ -1,67 +1,92 @@
 /*
- * Paging. The kernel identity-maps all managed physical RAM, so kernel
- * virtual == physical. Applications are mapped high (default image base
- * 0x40000000) into pages allocated from the PMM, which keeps every app
- * image out of the kernel's address range and lets the loader always
- * honor the PE ImageBase.
+ * 4-level paging (PML4 -> PDPT -> PD -> PT, 4 KiB pages). boot.S
+ * already put the CPU in long mode using a temporary 1 GiB/2 MiB-page
+ * identity map; paging_init() replaces it with a real 4 KiB-granular
+ * map built from PMM-allocated frames, covering every managed physical
+ * page. That granularity is what lets paging_map()/paging_unmap() punch
+ * individual holes later — for app images and the framebuffer — without
+ * touching neighboring pages.
+ *
+ * The kernel identity-maps all managed physical RAM (kernel virtual ==
+ * physical), same as the 32-bit design. Everything we care about —
+ * kernel, apps, framebuffer — stays below 4 GiB by construction, so a
+ * single PML4 entry (covering 512 GiB) is all that's ever used.
  */
 #include "kernel.h"
 
-#define PDE_PRESENT 0x1
-#define PDE_RW      0x2
+#define PTE_PRESENT 0x1ull
+#define PTE_RW      0x2ull
+#define ENTRIES     512
 
-static u32 page_dir[1024] __attribute__((aligned(PAGE_SIZE)));
+static u64 pml4[ENTRIES] __attribute__((aligned(PAGE_SIZE)));
 
-extern void paging_enable(u32 dir_phys);
+extern void paging_enable(uptr pml4_phys);
 
-static u32 *get_table(u32 virt, int create)
+/* walk one level: table[index] must point at (or be freshly allocated
+   to point at) the next-level table; returns its virtual address,
+   which equals its physical address under our identity mapping */
+static u64 *walk(u64 *table, u32 index, int create)
 {
-    u32 pde = virt >> 22;
-    if (!(page_dir[pde] & PDE_PRESENT)) {
+    if (!(table[index] & PTE_PRESENT)) {
         if (!create)
             return NULL;
-        u32 phys = pmm_alloc_frame();
+        uptr phys = pmm_alloc_frame();
         if (!phys)
             return NULL;
-        memset((void *)phys, 0, PAGE_SIZE); /* identity-mapped kernel RAM */
-        page_dir[pde] = phys | PDE_PRESENT | PDE_RW;
+        memset((void *)phys, 0, PAGE_SIZE);
+        table[index] = phys | PTE_PRESENT | PTE_RW;
     }
-    return (u32 *)(page_dir[pde] & ~0xFFF);
+    return (u64 *)(uptr)(table[index] & ~0xFFFull);
 }
 
-int paging_map(u32 virt, u32 phys, int writable)
+static u64 *get_pt(uptr virt, int create)
 {
-    u32 *table = get_table(virt, 1);
-    if (!table)
+    u32 pml4_i = (virt >> 39) & 0x1FF;
+    u32 pdpt_i = (virt >> 30) & 0x1FF;
+    u32 pd_i   = (virt >> 21) & 0x1FF;
+
+    u64 *pdpt = walk(pml4, pml4_i, create);
+    if (!pdpt)
+        return NULL;
+    u64 *pd = walk(pdpt, pdpt_i, create);
+    if (!pd)
+        return NULL;
+    return walk(pd, pd_i, create);
+}
+
+int paging_map(uptr virt, uptr phys, int writable)
+{
+    u64 *pt = get_pt(virt, 1);
+    if (!pt)
         return -1;
-    table[(virt >> 12) & 0x3FF] =
-        (phys & ~0xFFF) | PDE_PRESENT | (writable ? PDE_RW : 0);
+    u32 pt_i = (virt >> 12) & 0x1FF;
+    pt[pt_i] = (phys & ~0xFFFull) | PTE_PRESENT | (writable ? PTE_RW : 0);
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
     return 0;
 }
 
-void paging_unmap(u32 virt)
+void paging_unmap(uptr virt)
 {
-    u32 *table = get_table(virt, 0);
-    if (!table)
+    u64 *pt = get_pt(virt, 0);
+    if (!pt)
         return;
-    table[(virt >> 12) & 0x3FF] = 0;
+    pt[(virt >> 12) & 0x1FF] = 0;
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
 }
 
 void paging_init(void)
 {
-    u32 end = pmm_managed_end();
+    uptr end = pmm_managed_end();
 
     /* identity map all managed RAM with 4 KiB pages, except page 0:
        leaving it unmapped turns null-pointer dereferences into page
        faults instead of silent reads of the real-mode IVT */
-    for (u32 addr = PAGE_SIZE; addr < end; addr += PAGE_SIZE) {
-        u32 *table = get_table(addr, 1);
-        if (!table)
+    for (uptr addr = PAGE_SIZE; addr < end; addr += PAGE_SIZE) {
+        u64 *pt = get_pt(addr, 1);
+        if (!pt)
             panic("paging: out of frames for page tables");
-        table[(addr >> 12) & 0x3FF] = addr | PDE_PRESENT | PDE_RW;
+        pt[(addr >> 12) & 0x1FF] = addr | PTE_PRESENT | PTE_RW;
     }
 
-    paging_enable((u32)page_dir);
+    paging_enable((uptr)pml4);
 }

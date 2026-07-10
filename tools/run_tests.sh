@@ -7,8 +7,9 @@ BUILD=${BUILD:-build}
 LOG=$BUILD/test.log
 
 feed() {
-    # give the OS time to boot / finish the previous command
-    sleep 2
+    # GRUB (SeaBIOS -> GRUB2 -> our kernel) adds a few seconds versus a
+    # direct -kernel boot, so give it more time before the first command
+    sleep 5
     for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
                "peinfo winhello.exe" "run winhello.exe with args" \
@@ -19,8 +20,10 @@ feed() {
     done
 }
 
-feed | timeout 90 qemu-system-i386 -m 128 -vga std \
-    -kernel "$BUILD/kernel.elf" -initrd "$BUILD/initrd.img" \
+# QEMU's own multiboot loader (-kernel) only accepts 32-bit ELF kernels;
+# AlphaOS is now x86-64, so it boots through the GRUB2 rescue ISO instead.
+feed | timeout 120 qemu-system-x86_64 -m 128 -vga std \
+    -cdrom "$BUILD/alphaos.iso" \
     -nographic -no-reboot | tee "$LOG"
 
 echo
@@ -37,7 +40,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.3"
+check "AlphaOS 0.4"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -47,7 +50,7 @@ check "1024x768x32 desktop"
 check "QEMU/Bochs VGA display adapter"             # lspci output
 check "/20[0-9][0-9] "                             # date shows a sane year
 check "hello.exe"                                  # ls output
-check "PE32 executable"                            # peinfo
+check "PE32+ executable"                           # peinfo
 check "image base     0x40000000"                  # peinfo
 check "Hello from hello.exe!"                      # app ran
 check "hello.exe exited with code 0"

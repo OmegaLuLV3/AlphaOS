@@ -1,11 +1,18 @@
 /*
- * PE32 (.exe) loader.
+ * PE32+ (x86-64 .exe) loader.
  *
  * Validates the full header chain (DOS MZ -> PE signature -> COFF ->
- * optional header -> sections), maps the image at its preferred
+ * PE32+ optional header -> sections), maps the image at its preferred
  * ImageBase via paging, copies section raw data, zero-fills the
- * VirtualSize tail (.bss), applies base relocations if present, then
- * calls the entry point with the AlphaOS API table.
+ * VirtualSize tail (.bss), resolves DLL imports against the kernel's
+ * Win32 export tables (patching the IAT — the same job Windows' own
+ * loader does), applies base relocations if the image had to move,
+ * then calls the entry point.
+ *
+ * AlphaOS is an x86-64 kernel, so this loader only accepts PE32+
+ * images built for AMD64 (IMAGE_FILE_MACHINE_AMD64) — a 32-bit PE32/
+ * i386 executable is rejected by the machine check, same as a genuine
+ * 64-bit Windows loader would reject a foreign architecture.
  *
  * Resource management: image pages, page tables, and every tracked heap
  * allocation the app made are reclaimed when it exits — including when
@@ -31,16 +38,16 @@ typedef struct {
     u16 characteristics;
 } __attribute__((packed)) coff_header_t;
 
+/* IMAGE_OPTIONAL_HEADER64 (PE32+) */
 typedef struct {
-    u16 magic;        /* 0x10B = PE32 */
+    u16 magic;        /* 0x20B = PE32+ */
     u8  linker_major, linker_minor;
     u32 size_of_code;
     u32 size_of_init_data;
     u32 size_of_uninit_data;
     u32 entry_point;  /* RVA */
     u32 base_of_code;
-    u32 base_of_data;
-    u32 image_base;
+    u64 image_base;
     u32 section_align;
     u32 file_align;
     u16 os_major, os_minor;
@@ -52,8 +59,8 @@ typedef struct {
     u32 checksum;
     u16 subsystem;
     u16 dll_characteristics;
-    u32 stack_reserve, stack_commit;
-    u32 heap_reserve, heap_commit;
+    u64 stack_reserve, stack_commit;
+    u64 heap_reserve, heap_commit;
     u32 loader_flags;
     u32 num_data_dirs;
     struct { u32 rva; u32 size; } data_dir[16];
@@ -70,13 +77,19 @@ typedef struct {
     u32 characteristics;
 } __attribute__((packed)) section_header_t;
 
-#define PE_MACHINE_I386   0x014C
-#define PE_MAGIC_PE32     0x010B
+#define PE_MACHINE_AMD64  0x8664
+#define PE_MAGIC_PE32PLUS 0x020B
 #define DIR_IMPORT        1
 #define DIR_BASERELOC     5
 #define MAX_IMAGE_SIZE    (16u * 1024 * 1024)
 
-/* IMAGE_IMPORT_DESCRIPTOR */
+#define IMAGE_REL_BASED_HIGHLOW 3   /* 32-bit field += delta            */
+#define IMAGE_REL_BASED_DIR64   10  /* 64-bit field += delta (AMD64)    */
+#define IMAGE_ORDINAL_FLAG64    0x8000000000000000ull
+
+/* IMAGE_IMPORT_DESCRIPTOR — unchanged between PE32 and PE32+; its RVA
+   fields are always 32-bit. Only the thunk arrays it points at widen
+   to 8 bytes (IMAGE_THUNK_DATA64) in PE32+. */
 typedef struct {
     u32 ilt_rva;    /* OriginalFirstThunk: hint/name RVAs */
     u32 timestamp;
@@ -109,16 +122,16 @@ static const char *pe_parse(const rd_file_t *f, pe_view_t *out)
 
     const coff_header_t *coff =
         (const coff_header_t *)(f->data + dos->e_lfanew + 4);
-    if (coff->machine != PE_MACHINE_I386)
-        return "not an i386 image";
-    if (coff->opt_hdr_size < 0x60)
+    if (coff->machine != PE_MACHINE_AMD64)
+        return "not an x86-64 image (AlphaOS is a 64-bit OS)";
+    if (coff->opt_hdr_size < 0x70) /* PE32+ fixed fields, before data_dir[] */
         return "optional header too small";
 
     const opt_header_t *opt = (const opt_header_t *)(coff + 1);
     if ((const u8 *)opt + coff->opt_hdr_size > f->data + f->size)
         return "optional header out of bounds";
-    if (opt->magic != PE_MAGIC_PE32)
-        return "not a PE32 image (PE32+ unsupported)";
+    if (opt->magic != PE_MAGIC_PE32PLUS)
+        return "not a PE32+ image (32-bit PE32 unsupported)";
     if (opt->section_align != PAGE_SIZE)
         return "section alignment must be 4096";
     if (opt->size_of_image == 0 || opt->size_of_image > MAX_IMAGE_SIZE)
@@ -179,21 +192,23 @@ static void pe_info_imports(const rd_file_t *f, const pe_view_t *pe)
         kprintf("  imports        %s:", (const char *)f->data + name_off);
         u32 ilt = rva_to_off(pe, d->ilt_rva ? d->ilt_rva : d->iat_rva);
         int col = 24;
-        while (ilt + 4 <= f->size) {
-            u32 thunk = *(const u32 *)(f->data + ilt);
+        while (ilt + 8 <= f->size) {
+            u64 thunk = *(const u64 *)(f->data + ilt);
             if (!thunk)
                 break;
-            u32 fn_off = rva_to_off(pe, thunk + 2);
-            const char *fn = fn_off < f->size
-                                 ? (const char *)f->data + fn_off
-                                 : "?";
+            const char *fn = "(ordinal)";
+            if (!(thunk & IMAGE_ORDINAL_FLAG64)) {
+                u32 fn_off = rva_to_off(pe, (u32)thunk + 2);
+                if (fn_off < f->size)
+                    fn = (const char *)f->data + fn_off;
+            }
             if (col + (int)strlen(fn) > 76) {
                 kprint("\n                ");
                 col = 16;
             }
             kprintf(" %s", fn);
             col += strlen(fn) + 1;
-            ilt += 4;
+            ilt += 8;
         }
         kputc('\n');
         off += sizeof(import_desc_t);
@@ -208,12 +223,13 @@ void pe_info(const rd_file_t *f)
         kprintf("peinfo: %s: %s\n", f->name, err);
         return;
     }
-    kprintf("%s: PE32 executable, %u bytes\n", f->name, f->size);
-    kprintf("  machine        i386 (0x%x)\n", pe.coff->machine);
+    kprintf("%s: PE32+ executable, %u bytes\n", f->name, f->size);
+    kprintf("  machine        x86-64 (0x%x)\n", pe.coff->machine);
     kprintf("  sections       %d\n", pe.coff->num_sections);
-    kprintf("  image base     %p\n", pe.opt->image_base);
+    kprintf("  image base     %p\n", (void *)pe.opt->image_base);
     kprintf("  entry point    %p (RVA 0x%x)\n",
-            pe.opt->image_base + pe.opt->entry_point, pe.opt->entry_point);
+            (void *)(pe.opt->image_base + pe.opt->entry_point),
+            pe.opt->entry_point);
     kprintf("  image size     %u KiB\n", pe.opt->size_of_image / 1024);
     kprintf("  subsystem      %d\n", pe.opt->subsystem);
     for (u32 i = 0; i < pe.coff->num_sections; i++) {
@@ -236,7 +252,7 @@ void pe_info(const rd_file_t *f)
  * Windows. Returns NULL on success (win_style set if any imports were
  * resolved), or an error string.
  */
-static const char *resolve_imports(u32 base, const pe_view_t *pe,
+static const char *resolve_imports(uptr base, const pe_view_t *pe,
                                    bool *win_style)
 {
     *win_style = false;
@@ -252,31 +268,31 @@ static const char *resolve_imports(u32 base, const pe_view_t *pe,
 
     for (import_desc_t *d = (import_desc_t *)(base + dir_rva);
          d->name_rva; d++) {
-        if ((u32)(d + 1) - base > img_size)
+        if ((uptr)(d + 1) - base > img_size)
             return "import descriptor out of bounds";
-        if (d->name_rva >= img_size || d->iat_rva + 4 > img_size)
+        if (d->name_rva >= img_size || d->iat_rva + 8 > img_size)
             return "import descriptor fields out of bounds";
 
         const char *dll = (const char *)(base + d->name_rva);
         u32 lookup_rva = d->ilt_rva ? d->ilt_rva : d->iat_rva;
-        u32 *lookup = (u32 *)(base + lookup_rva);
-        u32 *iat = (u32 *)(base + d->iat_rva);
+        u64 *lookup = (u64 *)(base + lookup_rva);
+        u64 *iat = (u64 *)(base + d->iat_rva);
 
         for (u32 i = 0; lookup[i]; i++) {
-            if ((base + lookup_rva + (i + 1) * 4) - base > img_size)
+            if ((base + lookup_rva + (i + 1) * 8) - base > img_size)
                 return "import thunk table out of bounds";
-            if (lookup[i] & 0x80000000)
+            if (lookup[i] & IMAGE_ORDINAL_FLAG64)
                 return "ordinal imports not supported (import by name)";
-            if (lookup[i] + 2 >= img_size)
+            if ((u32)lookup[i] + 2 >= img_size)
                 return "import hint/name out of bounds";
 
-            const char *func = (const char *)(base + lookup[i] + 2);
+            const char *func = (const char *)(base + (u32)lookup[i] + 2);
             void *impl = win_resolve(dll, func);
             if (!impl) {
                 kprintf("exec: unresolved import %s!%s\n", dll, func);
                 return "unresolved import";
             }
-            iat[i] = (u32)impl;
+            iat[i] = (u64)(uptr)impl;
         }
         *win_style = true;
     }
@@ -284,9 +300,9 @@ static const char *resolve_imports(u32 base, const pe_view_t *pe,
 }
 
 static void apply_relocs(const rd_file_t *f, const pe_view_t *pe,
-                         u32 loaded_base)
+                         uptr loaded_base)
 {
-    s32 delta = (s32)(loaded_base - pe->opt->image_base);
+    s64 delta = (s64)(loaded_base - pe->opt->image_base);
     if (delta == 0 || pe->opt->num_data_dirs <= DIR_BASERELOC)
         return;
     u32 rva = pe->opt->data_dir[DIR_BASERELOC].rva;
@@ -305,8 +321,11 @@ static void apply_relocs(const rd_file_t *f, const pe_view_t *pe,
         u32 n = (block_size - 8) / 2;
         for (u32 i = 0; i < n; i++) {
             u16 e = entries[i];
-            if ((e >> 12) == 3) /* IMAGE_REL_BASED_HIGHLOW */
-                *(u32 *)(loaded_base + page_rva + (e & 0xFFF)) += delta;
+            u32 type = e >> 12, off = e & 0xFFF;
+            if (type == IMAGE_REL_BASED_HIGHLOW)
+                *(u32 *)(loaded_base + page_rva + off) += (u32)delta;
+            else if (type == IMAGE_REL_BASED_DIR64)
+                *(u64 *)(loaded_base + page_rva + off) += (u64)delta;
         }
         block += block_size;
     }
@@ -322,11 +341,11 @@ int pe_run(const rd_file_t *f, const char *cmdline)
         return -1;
     }
 
-    u32 base = pe.opt->image_base;
+    uptr base = pe.opt->image_base;
     u32 pages = PAGE_ALIGN_UP(pe.opt->size_of_image) / PAGE_SIZE;
 
     /* keep the frame list so we can return them to the PMM on exit */
-    u32 *frames = kmalloc(pages * sizeof(u32));
+    uptr *frames = kmalloc(pages * sizeof(uptr));
     if (!frames) {
         kprint("exec: out of memory\n");
         return -1;
@@ -334,7 +353,7 @@ int pe_run(const rd_file_t *f, const char *cmdline)
 
     u32 mapped = 0;
     for (; mapped < pages; mapped++) {
-        u32 phys = pmm_alloc_frame();
+        uptr phys = pmm_alloc_frame();
         if (!phys || paging_map(base + mapped * PAGE_SIZE, phys, 1) < 0) {
             if (phys)
                 pmm_free_frame(phys);
@@ -348,7 +367,7 @@ int pe_run(const rd_file_t *f, const char *cmdline)
     }
 
     /* image is now addressable at its ImageBase: build it */
-    memset((void *)base, 0, pages * PAGE_SIZE);
+    memset((void *)base, 0, (usize)pages * PAGE_SIZE);
     memcpy((void *)base, f->data,
            pe.opt->size_of_headers < f->size ? pe.opt->size_of_headers
                                              : f->size);
@@ -381,7 +400,7 @@ int pe_run(const rd_file_t *f, const char *cmdline)
 
     int jmp = k_setjmp(proc.exit_jmp);
     if (jmp == 0) {
-        u32 entry = base + pe.opt->entry_point;
+        uptr entry = base + pe.opt->entry_point;
         proc.running = true;
         if (win_style)
             /* Windows convention: entry takes no args; the program
