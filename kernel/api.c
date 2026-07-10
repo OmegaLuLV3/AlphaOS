@@ -79,6 +79,39 @@ static int api_readline(char *buf, unsigned int max)
     return input_readline(buf, max);
 }
 
+/* ---- v2: windowing (backed by the window manager) ------------------- */
+
+static void *api_win_create(const char *title, int w, int h)
+{
+    if (!gui_active() || !current_process)
+        return NULL;
+    return wm_create(title, w, h, current_process, true);
+}
+
+static void api_win_destroy(void *win)
+{
+    if (win && current_process && ((window_t *)win)->owner == current_process)
+        wm_destroy(win);
+}
+
+static unsigned int *api_win_canvas(void *win)
+{
+    return win ? ((window_t *)win)->canvas : NULL;
+}
+
+static void api_win_present(void *win)
+{
+    if (win)
+        wm_present(win);
+}
+
+static int api_win_poll(void *win, alpha_event_t *ev)
+{
+    if (!win || !ev)
+        return 0;
+    return wm_poll_event(win, ev);
+}
+
 static const alpha_api_t table = {
     .version   = ALPHA_API_VERSION,
     .print     = kprint,
@@ -93,6 +126,11 @@ static const alpha_api_t table = {
     .sleep_ms  = sleep_ms,
     .uptime_ms = uptime_ms,
     .exit      = api_exit,
+    .win_create  = api_win_create,
+    .win_destroy = api_win_destroy,
+    .win_canvas  = api_win_canvas,
+    .win_present = api_win_present,
+    .win_poll    = api_win_poll,
 };
 
 const alpha_api_t *api_table(void)

@@ -34,6 +34,8 @@ void sleep_ms(u32 ms)
 {
     u32 target = ticks + (ms * tick_hz + 999) / 1000;
     while ((s32)(ticks - target) < 0) {
+        if (gui_active())
+            gui_pump(); /* keep the desktop responsive while apps sleep */
         sti();
         hlt();
     }

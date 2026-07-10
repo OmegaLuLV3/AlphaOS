@@ -6,7 +6,7 @@
  */
 #include "kernel.h"
 
-#define HEAP_SIZE  (8u * 1024 * 1024)
+#define HEAP_SIZE  (16u * 1024 * 1024) /* holds GUI buffers + app heaps */
 #define BLOCK_MAGIC 0xA1FA05B1
 
 typedef struct block {

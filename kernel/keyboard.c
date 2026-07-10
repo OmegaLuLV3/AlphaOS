@@ -56,26 +56,41 @@ void keyboard_init(void)
     irq_register(1, kbd_irq);
 }
 
+int kbd_pop(void)
+{
+    if (tail == head)
+        return -1;
+    cli();
+    u8 c = buf[tail];
+    tail = (tail + 1) % BUF_SIZE;
+    sti();
+    return c;
+}
+
 int input_getch(void)
 {
     for (;;) {
-        if (tail != head) {
-            cli();
-            u8 c = buf[tail];
-            tail = (tail + 1) % BUF_SIZE;
-            sti();
-            return c;
-        }
-        int s = serial_getc();
-        if (s >= 0) {
-            if (s == '\r')
-                s = '\n';
-            if (s == 0x7F)
-                s = '\b';
-            return s;
+        if (gui_active()) {
+            /* pump routes kbd/serial by focus and keeps the GUI alive */
+            gui_pump();
+            int c = gui_term_getch();
+            if (c >= 0)
+                return c;
+        } else {
+            int c = kbd_pop();
+            if (c >= 0)
+                return c;
+            int s = serial_getc();
+            if (s >= 0) {
+                if (s == '\r')
+                    s = '\n';
+                if (s == 0x7F)
+                    s = '\b';
+                return s;
+            }
         }
         sti();
-        hlt(); /* wake on next timer/keyboard interrupt */
+        hlt(); /* wake on next timer/keyboard/mouse interrupt */
     }
 }
 

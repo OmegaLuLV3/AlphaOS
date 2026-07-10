@@ -18,7 +18,7 @@ void pic_init(void)
     outb(PIC2_DATA, 0x01); io_wait();
 
     outb(PIC1_DATA, 0xF8); /* unmask IRQ 0 (timer), 1 (kbd), 2 (cascade) */
-    outb(PIC2_DATA, 0xFF);
+    outb(PIC2_DATA, 0xEF); /* unmask IRQ 12 (PS/2 mouse) */
 }
 
 void pic_eoi(u8 irq)

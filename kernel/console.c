@@ -10,6 +10,12 @@
 
 static u8 cur_x, cur_y;
 static u8 color = 0x07; /* light grey on black */
+static bool gui_console;  /* route output to the terminal window */
+
+void console_use_gui(void)
+{
+    gui_console = true;
+}
 
 static void move_cursor(void)
 {
@@ -39,17 +45,23 @@ void console_init(void)
 
 void console_clear(void)
 {
+    serial_putc('\033');
+    serial_putc('c'); /* ANSI full reset for serial terminals */
+    if (gui_console) {
+        terminal_clear();
+        return;
+    }
     for (int i = 0; i < COLS * ROWS; i++)
         VGA_MEM[i] = (color << 8) | ' ';
     cur_x = cur_y = 0;
     move_cursor();
-    serial_putc('\033');
-    serial_putc('c'); /* ANSI full reset for serial terminals */
 }
 
 void console_set_color(u8 fg, u8 bg)
 {
     color = (bg << 4) | (fg & 0x0F);
+    if (gui_console)
+        terminal_set_color(fg, bg);
 }
 
 void kputc(char c)
@@ -57,6 +69,11 @@ void kputc(char c)
     if (c == '\n')
         serial_putc('\r');
     serial_putc(c);
+
+    if (gui_console) {
+        terminal_putc(c);
+        return;
+    }
 
     switch (c) {
     case '\n':

@@ -12,13 +12,13 @@ feed() {
     for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
                "run crash.exe" "run nope.exe" "echo still alive" \
-               "mem" "uptime" "halt"; do
+               "lspci" "date" "mem" "uptime" "halt"; do
         printf '%s\n' "$cmd"
         sleep 1
     done
 }
 
-feed | timeout 60 qemu-system-i386 -m 128 \
+feed | timeout 90 qemu-system-i386 -m 128 -vga std \
     -kernel "$BUILD/kernel.elf" -initrd "$BUILD/initrd.img" \
     -nographic -no-reboot | tee "$LOG"
 
@@ -36,7 +36,15 @@ check() {
     fi
 }
 
-check "AlphaOS 0.1"
+check "AlphaOS 0.2"
+check "pci: .* device(s.*bus\|s)"                  # pci scan ran
+check "font: captured 8x16 VGA font"
+check "mouse: PS/2 mouse on IRQ 12"
+check "bga: 1024x768x32 framebuffer"
+check "gui: desktop ready"
+check "1024x768x32 desktop"
+check "QEMU/Bochs VGA display adapter"             # lspci output
+check "/20[0-9][0-9] "                             # date shows a sane year
 check "hello.exe"                                  # ls output
 check "PE32 executable"                            # peinfo
 check "image base     0x40000000"                  # peinfo

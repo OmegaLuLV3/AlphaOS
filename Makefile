@@ -22,12 +22,13 @@ KLDFLAGS := -m elf_i386 -T kernel/linker.ld -nostdlib
 
 KOBJS := boot.o setjmp.o isr.o kernel.o console.o serial.o string.o \
          gdt.o idt.o pic.o pit.o keyboard.o pmm.o paging.o kheap.o \
-         ramdisk.o pe.o api.o shell.o
+         ramdisk.o pe.o api.o shell.o \
+         pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o
 KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------
 
-APPS     := hello sysinfo memhog primes crash
+APPS     := hello sysinfo memhog primes crash paint
 APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
 
 .PHONY: all run run-vga test clean
@@ -68,7 +69,7 @@ $(BUILD)/initrd.img: $(APP_EXES) tools/mkinitrd.py
 
 # ---- run / test -----------------------------------------------------
 
-QEMU := qemu-system-i386 -m 128 -kernel $(BUILD)/kernel.elf \
+QEMU := qemu-system-i386 -m 128 -vga std -kernel $(BUILD)/kernel.elf \
         -initrd $(BUILD)/initrd.img
 
 run: all

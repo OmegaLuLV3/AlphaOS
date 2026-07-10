@@ -21,14 +21,26 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     kheap_init();
     ramdisk_init(mbi);
 
+    /* driver bring-up */
+    font_init();  /* capture the VGA font while still in text mode */
+    pci_scan();
+    mouse_init();
+    bool gui = bga_init(1024, 768) == 0;
+    if (gui) {
+        gui_init();
+        console_use_gui(); /* console output now goes to the terminal */
+    }
+
     sti();
 
     console_set_color(ALPHA_LCYAN, ALPHA_BLACK);
-    kprint("\n  AlphaOS 0.1 -- a lightweight OS that runs .exe files\n");
+    kprint("\n  AlphaOS 0.2 -- a lightweight OS that runs .exe files\n");
     console_set_color(ALPHA_DGREY, ALPHA_BLACK);
     kprintf("  %u KiB RAM managed | %u KiB in use | %u file(s) on ramdisk\n",
             pmm_total_kib(), pmm_total_kib() - pmm_free_kib(),
             ramdisk_count());
+    kprintf("  display: %s | %u PCI device(s)\n",
+            gui ? "1024x768x32 desktop" : "VGA text mode", pci_count());
     console_set_color(ALPHA_LGREY, ALPHA_BLACK);
     kprint("  type 'help' for commands\n\n");
 

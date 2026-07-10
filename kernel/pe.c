@@ -265,6 +265,7 @@ int pe_run(const rd_file_t *f)
     sti(); /* a fault longjmp arrives here with interrupts off */
 
     u32 leaked = proc.heap_bytes;
+    wm_destroy_owned(&proc); /* close any windows it left open */
     proc_release_all(&proc);
     current_process = NULL;
 

@@ -20,6 +20,26 @@ static inline u8 inb(u16 port)
     __asm__ volatile("inb %1, %0" : "=a"(v) : "Nd"(port));
     return v;
 }
+static inline void outw(u16 port, u16 val)
+{
+    __asm__ volatile("outw %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline u16 inw(u16 port)
+{
+    u16 v;
+    __asm__ volatile("inw %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
+static inline void outl(u16 port, u32 val)
+{
+    __asm__ volatile("outl %0, %1" : : "a"(val), "Nd"(port));
+}
+static inline u32 inl(u16 port)
+{
+    u32 v;
+    __asm__ volatile("inl %1, %0" : "=a"(v) : "Nd"(port));
+    return v;
+}
 static inline void io_wait(void) { outb(0x80, 0); }
 static inline void sti(void) { __asm__ volatile("sti"); }
 static inline void cli(void) { __asm__ volatile("cli"); }
@@ -75,8 +95,62 @@ void sleep_ms(u32 ms);
 
 /* ---- keyboard.c ---------------------------------------------------- */
 void keyboard_init(void);
+int  kbd_pop(void);                     /* -1 if ring buffer empty */
 int  input_getch(void);                 /* blocking; merges kbd + serial */
 int  input_readline(char *buf, u32 max);
+
+/* ---- mouse.c -------------------------------------------------------- */
+void mouse_init(void);
+int  mouse_pop(int *dx, int *dy, u8 *buttons); /* 0 = nothing pending */
+
+/* ---- pci.c ----------------------------------------------------------*/
+typedef struct pci_dev {
+    u8  bus, slot, func;
+    u16 vendor, device;
+    u8  class_code, subclass;
+    u32 bar0;
+    const char *name;
+} pci_dev_t;
+
+void       pci_scan(void);
+u32        pci_count(void);
+pci_dev_t *pci_get(u32 i);
+pci_dev_t *pci_find(u16 vendor, u16 device);
+
+/* ---- rtc.c ----------------------------------------------------------*/
+typedef struct rtc_time {
+    u16 year;
+    u8 month, day, hour, min, sec;
+} rtc_time_t;
+
+void rtc_read(rtc_time_t *t);
+
+/* ---- font.c ---------------------------------------------------------*/
+extern u8 vga_font[256 * 16];           /* 8x16 glyphs */
+void font_init(void);
+
+/* ---- bga.c (Bochs/QEMU display adapter) ------------------------------*/
+int  bga_init(int w, int h);            /* 0 on success */
+u32 *bga_framebuffer(void);
+int  bga_width(void);
+int  bga_height(void);
+
+/* ---- gfx.c -----------------------------------------------------------*/
+typedef struct surface {
+    u32 *px;
+    int w, h;
+} surface_t;
+
+#define RGB(r, g, b) (0xFF000000u | ((r) << 16) | ((g) << 8) | (b))
+
+void gfx_fill(surface_t *s, int x, int y, int w, int h, u32 c);
+void gfx_rect(surface_t *s, int x, int y, int w, int h, u32 c);
+void gfx_gradient_v(surface_t *s, int x, int y, int w, int h, u32 top, u32 bot);
+void gfx_blend(surface_t *s, int x, int y, int w, int h, u32 c, u8 alpha);
+void gfx_char(surface_t *s, int x, int y, char ch, u32 fg);
+void gfx_text(surface_t *s, int x, int y, const char *str, u32 fg);
+void gfx_circle(surface_t *s, int cx, int cy, int r, u32 c);
+void gfx_blit(surface_t *dst, int dx, int dy, const surface_t *src);
 
 /* ---- pmm.c --------------------------------------------------------- */
 void pmm_init(multiboot_info_t *mbi, u32 kernel_end);
@@ -132,6 +206,43 @@ extern process_t *current_process;
 
 int  pe_run(const rd_file_t *file);      /* returns app exit code */
 void pe_info(const rd_file_t *file);     /* print PE headers */
+
+/* ---- window manager (wm.c) ------------------------------------------ */
+#define WM_EVQ_SIZE 32
+
+typedef struct window {
+    int  x, y;              /* frame top-left on screen   */
+    int  w, h;              /* canvas (content) size      */
+    char title[40];
+    u32 *canvas;            /* w*h ARGB32                 */
+    bool closable;
+    process_t *owner;       /* NULL = kernel (terminal)   */
+    struct window *next;    /* z-order list, tail is topmost */
+    alpha_event_t evq[WM_EVQ_SIZE];
+    u32 ev_head, ev_tail;
+} window_t;
+
+void      gui_init(void);
+bool      gui_active(void);
+void      gui_pump(void);               /* mouse/kbd/clock + recomposite */
+void      gui_inject_line(const char *cmd); /* type a command into the shell */
+int       gui_term_getch(void);         /* -1 if terminal queue empty */
+window_t *wm_create(const char *title, int w, int h,
+                    process_t *owner, bool closable);
+void      wm_destroy(window_t *win);
+void      wm_present(window_t *win);
+int       wm_poll_event(window_t *win, alpha_event_t *ev);
+void      wm_destroy_owned(process_t *p);
+void      wm_mark_dirty(void);          /* throttled recomposite */
+
+/* ---- terminal.c (shell window in GUI mode) --------------------------- */
+void terminal_create(void);
+void terminal_putc(char c);
+void terminal_clear(void);
+void terminal_set_color(u8 fg, u8 bg);
+
+/* console GUI routing */
+void console_use_gui(void);
 
 /* ---- api.c --------------------------------------------------------- */
 const alpha_api_t *api_table(void);

@@ -12,7 +12,7 @@
 #ifndef ALPHA_API_H
 #define ALPHA_API_H
 
-#define ALPHA_API_VERSION 1
+#define ALPHA_API_VERSION 2
 
 typedef struct alpha_meminfo {
     unsigned int total_kib;   /* usable RAM managed by the kernel        */
@@ -20,6 +20,23 @@ typedef struct alpha_meminfo {
     unsigned int heap_used;   /* bytes used in the kernel heap           */
     unsigned int heap_free;   /* bytes free in the kernel heap           */
 } alpha_meminfo_t;
+
+/* window events (API v2) */
+enum {
+    ALPHA_EV_NONE = 0,
+    ALPHA_EV_KEY,          /* key: ASCII code                       */
+    ALPHA_EV_MOUSE_DOWN,   /* x,y: canvas coords, buttons: bitmask  */
+    ALPHA_EV_MOUSE_UP,
+    ALPHA_EV_MOUSE_MOVE,
+    ALPHA_EV_CLOSE,        /* user clicked the close button         */
+};
+
+typedef struct alpha_event {
+    unsigned int type;
+    int x, y;
+    int buttons;           /* bit 0 = left, bit 1 = right */
+    int key;
+} alpha_event_t;
 
 typedef struct alpha_api {
     unsigned int version;
@@ -45,6 +62,14 @@ typedef struct alpha_api {
 
     /* process */
     void (*exit)(int code); /* does not return */
+
+    /* ---- v2: windowing (NULL / absent when the OS runs in text mode;
+       check version >= 2 AND win_create != NULL before using) ---- */
+    void *(*win_create)(const char *title, int w, int h);
+    void  (*win_destroy)(void *win);
+    unsigned int *(*win_canvas)(void *win);  /* w*h ARGB32 pixels */
+    void  (*win_present)(void *win);         /* push canvas to screen */
+    int   (*win_poll)(void *win, alpha_event_t *ev); /* 1 = got event */
 } alpha_api_t;
 
 /* VGA color codes for set_color() */

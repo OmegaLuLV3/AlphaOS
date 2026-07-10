@@ -10,6 +10,8 @@ static void cmd_help(void)
            "  run <file.exe>  load and execute a PE executable\n"
            "  peinfo <file>   show PE headers of an executable\n"
            "  mem             physical memory and heap statistics\n"
+           "  lspci           list devices on the PCI bus\n"
+           "  date            read the real-time clock\n"
            "  uptime          time since boot\n"
            "  clear           clear the screen\n"
            "  echo <text>     print text\n"
@@ -39,6 +41,23 @@ static void cmd_mem(void)
     kprintf("physical: %u KiB total, %u KiB used, %u KiB free\n",
             total, total - free_k, free_k);
     kprintf("kheap:    %u bytes used, %u bytes free\n", hu, hf);
+}
+
+static void cmd_lspci(void)
+{
+    for (u32 i = 0; i < pci_count(); i++) {
+        pci_dev_t *d = pci_get(i);
+        kprintf("  %02x:%02x.%d  %04x:%04x  %s\n",
+                d->bus, d->slot, d->func, d->vendor, d->device, d->name);
+    }
+}
+
+static void cmd_date(void)
+{
+    rtc_time_t t;
+    rtc_read(&t);
+    kprintf("%02d/%02d/%d %02d:%02d:%02d UTC\n",
+            t.day, t.month, t.year, t.hour, t.min, t.sec);
 }
 
 static void cmd_uptime(void)
@@ -112,6 +131,10 @@ void shell_run(void)
             cmd_mem();
         else if (strcmp(line, "uptime") == 0)
             cmd_uptime();
+        else if (strcmp(line, "lspci") == 0)
+            cmd_lspci();
+        else if (strcmp(line, "date") == 0)
+            cmd_date();
         else if (strcmp(line, "clear") == 0)
             console_clear();
         else if (strcmp(line, "echo") == 0)
