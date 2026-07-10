@@ -1,0 +1,135 @@
+/* The AlphaOS command shell. */
+#include "kernel.h"
+
+#define LINE_MAX 128
+
+static void cmd_help(void)
+{
+    kprint("commands:\n"
+           "  ls              list files on the ramdisk\n"
+           "  run <file.exe>  load and execute a PE executable\n"
+           "  peinfo <file>   show PE headers of an executable\n"
+           "  mem             physical memory and heap statistics\n"
+           "  uptime          time since boot\n"
+           "  clear           clear the screen\n"
+           "  echo <text>     print text\n"
+           "  help            this text\n"
+           "  halt            power off\n"
+           "typing a bare name ending in .exe also runs it\n");
+}
+
+static void cmd_ls(void)
+{
+    u32 n = ramdisk_count();
+    if (!n) {
+        kprint("(ramdisk empty)\n");
+        return;
+    }
+    for (u32 i = 0; i < n; i++) {
+        rd_file_t *f = ramdisk_get(i);
+        kprintf("  %6u  %s\n", f->size, f->name);
+    }
+}
+
+static void cmd_mem(void)
+{
+    u32 total = pmm_total_kib(), free_k = pmm_free_kib();
+    u32 hu, hf;
+    kheap_stats(&hu, &hf);
+    kprintf("physical: %u KiB total, %u KiB used, %u KiB free\n",
+            total, total - free_k, free_k);
+    kprintf("kheap:    %u bytes used, %u bytes free\n", hu, hf);
+}
+
+static void cmd_uptime(void)
+{
+    u32 ms = uptime_ms();
+    kprintf("up %u.%02us (%u ticks)\n", ms / 1000, (ms % 1000) / 10,
+            pit_ticks());
+}
+
+static void cmd_run(const char *name)
+{
+    if (!*name) {
+        kprint("usage: run <file.exe>\n");
+        return;
+    }
+    rd_file_t *f = ramdisk_find(name);
+    if (!f) {
+        kprintf("run: %s: not found (try 'ls')\n", name);
+        return;
+    }
+    u32 t0 = uptime_ms();
+    int code = pe_run(f);
+    kprintf("[os] %s exited with code %d (%u ms)\n",
+            name, code, uptime_ms() - t0);
+}
+
+static bool ends_with_exe(const char *s)
+{
+    usize n = strlen(s);
+    return n > 4 && strcmp(s + n - 4, ".exe") == 0;
+}
+
+static void halt_machine(void)
+{
+    kprint("powering off...\n");
+    /* qemu/bochs poweroff ports; fall back to halt loop on real HW */
+    outb(0x604, 0x00);
+    outb(0xB004, 0x00);
+    __asm__ volatile("outw %0, %1" : : "a"((u16)0x2000), "Nd"((u16)0x604));
+    cli();
+    for (;;)
+        hlt();
+}
+
+void shell_run(void)
+{
+    char line[LINE_MAX];
+
+    for (;;) {
+        console_set_color(ALPHA_LGREEN, ALPHA_BLACK);
+        kprint("alpha> ");
+        console_set_color(ALPHA_LGREY, ALPHA_BLACK);
+        input_readline(line, LINE_MAX);
+
+        /* split command word / argument */
+        char *arg = line;
+        while (*arg && *arg != ' ')
+            arg++;
+        if (*arg)
+            *arg++ = 0;
+        while (*arg == ' ')
+            arg++;
+
+        if (!line[0])
+            continue;
+        else if (strcmp(line, "help") == 0)
+            cmd_help();
+        else if (strcmp(line, "ls") == 0)
+            cmd_ls();
+        else if (strcmp(line, "mem") == 0)
+            cmd_mem();
+        else if (strcmp(line, "uptime") == 0)
+            cmd_uptime();
+        else if (strcmp(line, "clear") == 0)
+            console_clear();
+        else if (strcmp(line, "echo") == 0)
+            kprintf("%s\n", arg);
+        else if (strcmp(line, "run") == 0)
+            cmd_run(arg);
+        else if (strcmp(line, "peinfo") == 0) {
+            rd_file_t *f = ramdisk_find(arg);
+            if (f)
+                pe_info(f);
+            else
+                kprintf("peinfo: %s: not found\n", arg);
+        }
+        else if (strcmp(line, "halt") == 0 || strcmp(line, "poweroff") == 0)
+            halt_machine();
+        else if (ends_with_exe(line))
+            cmd_run(line);
+        else
+            kprintf("%s: unknown command (try 'help')\n", line);
+    }
+}
