@@ -16,6 +16,14 @@ I am a PE32 executable loaded by AlphaOS (API v2).
 [os] hello.exe exited with code 0 (0 ms)
 ```
 
+![start menu](docs/screenshot-startmenu.png)
+*The desktop: terminal window running the shell, start menu, taskbar
+with live RTC clock.*
+
+![paint.exe](docs/screenshot-paint.png)
+*`paint.exe` — a PE32 executable that opens its own window through the
+AlphaOS windowing API.*
+
 ## Highlights
 
 - **Real PE32 loader** — validates the full header chain (DOS `MZ` → PE

@@ -27,6 +27,16 @@ static void dot(int x, int y, unsigned int color)
         }
 }
 
+/* interpolate between events so fast mouse motion still draws a stroke */
+static void stroke(int x0, int y0, int x1, int y1, unsigned int color)
+{
+    int dx = x1 > x0 ? x1 - x0 : x0 - x1;
+    int dy = y1 > y0 ? y1 - y0 : y0 - y1;
+    int steps = (dx > dy ? dx : dy) + 1;
+    for (int i = 0; i <= steps; i++)
+        dot(x0 + (x1 - x0) * i / steps, y0 + (y1 - y0) * i / steps, color);
+}
+
 int app_main(const alpha_api_t *os)
 {
     if (os->version < 2 || !os->win_create) {
@@ -55,6 +65,7 @@ int app_main(const alpha_api_t *os)
 
     unsigned int color = palette[0];
     int drawing = 0, running = 1;
+    int lx = 0, ly = 0;
     alpha_event_t ev;
 
     while (running) {
@@ -71,6 +82,8 @@ int app_main(const alpha_api_t *os)
                         color = palette[p];
                 } else {
                     drawing = 1;
+                    lx = ev.x;
+                    ly = ev.y;
                     dot(ev.x, ev.y, color);
                     changed = 1;
                 }
@@ -80,7 +93,9 @@ int app_main(const alpha_api_t *os)
                 break;
             case ALPHA_EV_MOUSE_MOVE:
                 if (drawing && (ev.buttons & 1)) {
-                    dot(ev.x, ev.y, color);
+                    stroke(lx, ly, ev.x, ev.y, color);
+                    lx = ev.x;
+                    ly = ev.y;
                     changed = 1;
                 }
                 break;

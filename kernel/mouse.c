@@ -42,8 +42,10 @@ static void mouse_irq(regs_t *r)
     (void)r;
     u8 data = inb(0x60);
 
-    if (cycle == 0 && !(data & 0x08))
-        return; /* out of sync: wait for a header byte */
+    /* a valid header byte has bit 3 set and no overflow bits; this also
+       rejects stray 0xFA ACKs so one bad byte can't shift the stream */
+    if (cycle == 0 && (data & 0xC8) != 0x08)
+        return;
     pkt[cycle++] = data;
     if (cycle < 3)
         return;
@@ -79,6 +81,10 @@ void mouse_init(void)
 
     mouse_send(0xF6); /* set defaults */
     mouse_send(0xF4); /* enable data reporting */
+
+    /* drain any late ACKs so the packet stream starts aligned */
+    for (u32 i = 0; i < 16 && (inb(0x64) & 0x01); i++)
+        inb(0x60);
 
     irq_register(12, mouse_irq);
     kprint("mouse: PS/2 mouse on IRQ 12\n");
