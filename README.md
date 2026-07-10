@@ -1,19 +1,25 @@
 # AlphaOS
 
 A lightweight 32-bit x86 operating system, written from scratch in C and
-assembly, that **loads and runs `.exe` (PE32) files** — now with a
-Windows-7-inspired graphical desktop and a real driver layer, while
-staying tiny and careful about resources.
+assembly, that **loads and runs `.exe` (PE32) files the way Windows
+does** — resolving their DLL import tables against a built-in Win32 API
+subset — with a Windows-7-inspired graphical desktop and a real driver
+layer, while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.2 -- a lightweight OS that runs .exe files
-  130944 KiB RAM managed | 17608 KiB in use | 6 file(s) on ramdisk
+  AlphaOS 0.3 -- a lightweight OS that runs .exe files
+  130944 KiB RAM managed | 17672 KiB in use | 8 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
-alpha> run hello.exe
-Hello from hello.exe!
-I am a PE32 executable loaded by AlphaOS (API v2).
-[os] hello.exe exited with code 0 (0 ms)
+alpha> run winhello.exe with args
+Hello from winhello.exe -- a Win32-style program!
+My imports were resolved from the PE import table.
+GetCommandLineA: "winhello.exe with args"
+VirtualAlloc gave me a page and it works.
+HeapAlloc: 15th triangular number is 120
+GetProcAddress(kernel32, GetTickCount) -> uptime 9080 ms
+winhello: done, calling ExitProcess(0)
+[os] winhello.exe exited with code 0 (60 ms)
 ```
 
 ![start menu](docs/screenshot-startmenu.png)
@@ -24,6 +30,10 @@ with live RTC clock.*
 *`paint.exe` — a PE32 executable that opens its own window through the
 AlphaOS windowing API.*
 
+![msgbox.exe](docs/screenshot-msgbox.png)
+*`msgbox.exe` — a Windows-style program calling
+`user32.dll!MessageBoxA` through its PE import table.*
+
 ## Highlights
 
 - **Real PE32 loader** — validates the full header chain (DOS `MZ` → PE
@@ -31,7 +41,20 @@ AlphaOS windowing API.*
   its preferred `ImageBase` via paging, copies sections, zero-fills the
   `.bss` tail, and applies base relocations. The `.exe` files it runs are
   structurally valid PE files — `file` reports them as
-  `PE32 executable (console) Intel 80386`.
+  `PE32 executable (console) Intel 80386`, and `objdump -p` parses their
+  import tables.
+- **Native-Windows-style API** — programs import OS functions by name
+  from `kernel32.dll` / `user32.dll` through a genuine PE **import
+  table**; the loader patches their IAT exactly like Windows' loader
+  does. The implemented subset (all `stdcall`, real signatures):
+  `ExitProcess`, `GetStdHandle`, `WriteConsoleA`, `WriteFile`,
+  `ReadConsoleA`, `Sleep`, `GetTickCount`, `VirtualAlloc`/`VirtualFree`,
+  `GetProcessHeap`, `HeapAlloc`/`HeapFree`, `GetCommandLineA`,
+  `GetLastError`/`SetLastError`, `LoadLibraryA`, `GetProcAddress`,
+  `lstrlenA`, and `user32.dll!MessageBoxA` — which draws a real modal
+  dialog with an OK button. Unresolved imports fail the load with the
+  missing `dll!symbol` named. Legacy AlphaOS-API programs (no imports)
+  still run; the loader picks the convention per binary.
 - **GUI desktop (Windows-7 style)** — gradient wallpaper, overlapping
   draggable windows with alpha-blended "glass" title bars and drop
   shadows, a taskbar with a start orb, per-window buttons and a live RTC
@@ -75,7 +98,7 @@ Requirements: `gcc` (with 32-bit support), `binutils`, `make`,
 make          # build kernel, .exe apps, and the ramdisk image
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (25 assertions)
+make test     # scripted end-to-end boot test (34 assertions)
 ```
 
 In the GUI: click the orb for the start menu, launch `paint.exe`, drag
@@ -104,6 +127,8 @@ is the same shell as the serial console — both are live at once.
 | `memhog.exe` | leak reclamation: frees half its buffers, OS reclaims the rest |
 | `crash.exe` | fault isolation: null deref kills the app, not the OS |
 | `paint.exe` | **GUI app**: opens its own window, mouse drawing, palette |
+| `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
+| `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |
 
 ## How a `.exe` is born and executed
 
@@ -113,7 +138,12 @@ apps/foo.c ──gcc -m32──▶ foo.o ──ld (base 0x40001000)──▶ foo
    ──tools/mkinitrd.py──▶ initrd.img ──multiboot module──▶ ramdisk
 ```
 
-At `run foo.exe` time the kernel:
+Windows-style apps additionally link IAT slots + trampolines generated
+by `tools/mkimports.py` from `apps/win32/imports.list`, and `mkpe.py`
+emits the matching PE import directory (descriptors, lookup tables,
+hint/name entries).
+
+At `run foo.exe [args]` time the kernel:
 
 1. parses and validates the PE headers and section table,
 2. allocates physical frames and maps them at the PE's `ImageBase`
@@ -121,29 +151,42 @@ At `run foo.exe` time the kernel:
    base is always honored),
 3. copies each section to its `VirtualAddress`, zero-fills `.bss`,
    applies `.reloc` fixups if the base ever had to change,
-4. calls the entry point with the AlphaOS API table
-   (`int app_main(const alpha_api_t *os)`) — console I/O, alloc/free,
-   sleep, meminfo, exit, and in API v2: `win_create` / `win_canvas` /
-   `win_present` / `win_poll` / `win_destroy` for windowed apps,
-5. on exit or crash: frees tracked heap allocations, closes leftover
-   windows, unmaps and frees the image pages, reports anything it had
-   to reclaim.
+4. **resolves the import table**: every `dll!name` the image imports is
+   looked up in the kernel's kernel32/user32 export tables and written
+   into the image's IAT — the same job Windows' loader performs,
+5. calls the entry point. Binaries with imports get the Windows
+   convention (no arguments — the OS is reached purely through
+   imports); import-free binaries get the legacy AlphaOS convention
+   (`int app_main(const alpha_api_t *os)`, which also carries the
+   windowing API used by `paint.exe`),
+6. on exit or crash: frees tracked heap allocations (`VirtualAlloc`,
+   `HeapAlloc`, and AlphaOS `alloc` all feed the same per-process
+   tracker), closes leftover windows, unmaps and frees the image pages,
+   and reports anything it had to reclaim.
 
 Apps run in ring 0 in a dedicated address range — a deliberate
 lightweight design (no TSS/ring-3 machinery); protection comes from
 paging, validation, and exception recovery rather than privilege levels.
 
-Note: AlphaOS runs PE executables built against its own API — Windows
-programs won't run, since AlphaOS implements its own syscall table, not
-the Win32 API (that would be a Wine-sized project).
+Scope note: AlphaOS implements the Win32 *mechanism* (PE imports,
+stdcall, IAT patching) and a useful API subset. A program written
+against this subset — even built with a real Windows toolchain
+(MinGW `-nostdlib`, no CRT) — runs unmodified. Arbitrary off-the-shelf
+Windows software still won't: that needs the full Win32 surface and a
+CRT (a Wine-sized project). Unsupported imports are reported by name at
+load time.
 
 ## Layout
 
 ```
 kernel/   boot.S, GDT/IDT, PIC/PIT, drivers (pci, bga, mouse, kbd, rtc,
-          serial, font), pmm, paging, kheap, ramdisk, PE loader, API,
+          serial, font), pmm, paging, kheap, ramdisk, PE loader + import
+          resolver, Win32 API (win32.c), AlphaOS API, gfx, window
+          manager/compositor, terminal, shell
           gfx primitives, window manager/compositor, terminal, shell
-apps/     crt0.S, app.ld, alpha.h and the sample programs
-tools/    mkpe.py (flat binary → PE32), mkinitrd.py, run_tests.sh
+apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
+          Windows-style runtime (win32.h, wincrt0.S, imports.list)
+tools/    mkpe.py (flat binary → PE32 w/ import tables), mkimports.py,
+          mkinitrd.py, run_tests.sh
 include/  alpha_api.h — the kernel↔app ABI, shared by both sides
 ```

@@ -11,6 +11,7 @@ feed() {
     sleep 2
     for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
+               "peinfo winhello.exe" "run winhello.exe with args" \
                "run crash.exe" "run nope.exe" "echo still alive" \
                "lspci" "date" "mem" "uptime" "halt"; do
         printf '%s\n' "$cmd"
@@ -36,7 +37,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.2"
+check "AlphaOS 0.3"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -54,6 +55,16 @@ check "AlphaOS system information"                 # sysinfo via bare name
 check "primes below 10000: 1229"                   # correct computation
 check "leaking the rest on purpose"                # memhog ran
 check "reclaimed"                                  # kernel reclaimed leaks
+# Windows-style API (PE import table)
+check "win32: .* exports in kernel32.dll"
+check "imports        kernel32.dll: ExitProcess"   # peinfo import dump
+check "Hello from winhello.exe"
+check "resolved from the PE import table"
+check 'GetCommandLineA: "winhello.exe with args"'
+check "VirtualAlloc gave me a page and it works"
+check "HeapAlloc: 15th triangular number is 120"
+check "GetProcAddress(kernel32, GetTickCount) -> uptime"
+check "winhello.exe exited with code 0"
 check "\[fault\]"                                  # crash.exe page fault
 check "killing process 'crash.exe'"                # fault isolation kicked in
 check "crash.exe exited with code -1"

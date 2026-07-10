@@ -25,6 +25,7 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     font_init();  /* capture the VGA font while still in text mode */
     pci_scan();
     mouse_init();
+    win32_init(); /* export tables for Windows-style .exe imports */
     bool gui = bga_init(1024, 768) == 0;
     if (gui) {
         gui_init();
@@ -34,7 +35,7 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     sti();
 
     console_set_color(ALPHA_LCYAN, ALPHA_BLACK);
-    kprint("\n  AlphaOS 0.2 -- a lightweight OS that runs .exe files\n");
+    kprint("\n  AlphaOS 0.3 -- a lightweight OS that runs .exe files\n");
     console_set_color(ALPHA_DGREY, ALPHA_BLACK);
     kprintf("  %u KiB RAM managed | %u KiB in use | %u file(s) on ramdisk\n",
             pmm_total_kib(), pmm_total_kib() - pmm_free_kib(),

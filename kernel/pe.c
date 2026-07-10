@@ -72,8 +72,18 @@ typedef struct {
 
 #define PE_MACHINE_I386   0x014C
 #define PE_MAGIC_PE32     0x010B
+#define DIR_IMPORT        1
 #define DIR_BASERELOC     5
 #define MAX_IMAGE_SIZE    (16u * 1024 * 1024)
+
+/* IMAGE_IMPORT_DESCRIPTOR */
+typedef struct {
+    u32 ilt_rva;    /* OriginalFirstThunk: hint/name RVAs */
+    u32 timestamp;
+    u32 forwarder;
+    u32 name_rva;   /* DLL name */
+    u32 iat_rva;    /* FirstThunk: slots patched by the loader */
+} __attribute__((packed)) import_desc_t;
 
 process_t *current_process;
 
@@ -140,6 +150,56 @@ static const char *pe_parse(const rd_file_t *f, pe_view_t *out)
 
 /* ---- info dump (shell `peinfo` command) ----------------------------- */
 
+/* translate an RVA to a file offset via the section table */
+static u32 rva_to_off(const pe_view_t *pe, u32 rva)
+{
+    for (u32 i = 0; i < pe->coff->num_sections; i++) {
+        const section_header_t *s = &pe->sections[i];
+        if (rva >= s->virtual_addr && rva < s->virtual_addr + s->raw_size)
+            return s->raw_ptr + (rva - s->virtual_addr);
+    }
+    return 0xFFFFFFFF;
+}
+
+static void pe_info_imports(const rd_file_t *f, const pe_view_t *pe)
+{
+    if (pe->opt->num_data_dirs <= DIR_IMPORT ||
+        !pe->opt->data_dir[DIR_IMPORT].rva) {
+        kprint("  imports        none (AlphaOS-API program)\n");
+        return;
+    }
+    u32 off = rva_to_off(pe, pe->opt->data_dir[DIR_IMPORT].rva);
+    while (off + sizeof(import_desc_t) <= f->size) {
+        const import_desc_t *d = (const import_desc_t *)(f->data + off);
+        if (!d->name_rva)
+            break;
+        u32 name_off = rva_to_off(pe, d->name_rva);
+        if (name_off >= f->size)
+            break;
+        kprintf("  imports        %s:", (const char *)f->data + name_off);
+        u32 ilt = rva_to_off(pe, d->ilt_rva ? d->ilt_rva : d->iat_rva);
+        int col = 24;
+        while (ilt + 4 <= f->size) {
+            u32 thunk = *(const u32 *)(f->data + ilt);
+            if (!thunk)
+                break;
+            u32 fn_off = rva_to_off(pe, thunk + 2);
+            const char *fn = fn_off < f->size
+                                 ? (const char *)f->data + fn_off
+                                 : "?";
+            if (col + (int)strlen(fn) > 76) {
+                kprint("\n                ");
+                col = 16;
+            }
+            kprintf(" %s", fn);
+            col += strlen(fn) + 1;
+            ilt += 4;
+        }
+        kputc('\n');
+        off += sizeof(import_desc_t);
+    }
+}
+
 void pe_info(const rd_file_t *f)
 {
     pe_view_t pe;
@@ -164,9 +224,64 @@ void pe_info(const rd_file_t *f)
         kprintf("  section %s  rva=0x%05x vsize=%u raw=%u\n",
                 name, s->virtual_addr, s->virtual_size, s->raw_size);
     }
+    pe_info_imports(f, &pe);
 }
 
 /* ---- loading & execution -------------------------------------------- */
+
+/*
+ * Resolve the PE import table against the kernel's Win32 export tables:
+ * for every DLL!Function the image imports, patch its IAT slot with the
+ * kernel implementation — the same job kernel32's loader does on real
+ * Windows. Returns NULL on success (win_style set if any imports were
+ * resolved), or an error string.
+ */
+static const char *resolve_imports(u32 base, const pe_view_t *pe,
+                                   bool *win_style)
+{
+    *win_style = false;
+    if (pe->opt->num_data_dirs <= DIR_IMPORT)
+        return NULL;
+    u32 dir_rva = pe->opt->data_dir[DIR_IMPORT].rva;
+    if (!dir_rva)
+        return NULL; /* no imports: legacy AlphaOS-API program */
+
+    u32 img_size = pe->opt->size_of_image;
+    if (dir_rva + sizeof(import_desc_t) > img_size)
+        return "import directory out of bounds";
+
+    for (import_desc_t *d = (import_desc_t *)(base + dir_rva);
+         d->name_rva; d++) {
+        if ((u32)(d + 1) - base > img_size)
+            return "import descriptor out of bounds";
+        if (d->name_rva >= img_size || d->iat_rva + 4 > img_size)
+            return "import descriptor fields out of bounds";
+
+        const char *dll = (const char *)(base + d->name_rva);
+        u32 lookup_rva = d->ilt_rva ? d->ilt_rva : d->iat_rva;
+        u32 *lookup = (u32 *)(base + lookup_rva);
+        u32 *iat = (u32 *)(base + d->iat_rva);
+
+        for (u32 i = 0; lookup[i]; i++) {
+            if ((base + lookup_rva + (i + 1) * 4) - base > img_size)
+                return "import thunk table out of bounds";
+            if (lookup[i] & 0x80000000)
+                return "ordinal imports not supported (import by name)";
+            if (lookup[i] + 2 >= img_size)
+                return "import hint/name out of bounds";
+
+            const char *func = (const char *)(base + lookup[i] + 2);
+            void *impl = win_resolve(dll, func);
+            if (!impl) {
+                kprintf("exec: unresolved import %s!%s\n", dll, func);
+                return "unresolved import";
+            }
+            iat[i] = (u32)impl;
+        }
+        *win_style = true;
+    }
+    return NULL;
+}
 
 static void apply_relocs(const rd_file_t *f, const pe_view_t *pe,
                          u32 loaded_base)
@@ -198,7 +313,7 @@ static void apply_relocs(const rd_file_t *f, const pe_view_t *pe,
     (void)f;
 }
 
-int pe_run(const rd_file_t *f)
+int pe_run(const rd_file_t *f, const char *cmdline)
 {
     pe_view_t pe;
     const char *err = pe_parse(f, &pe);
@@ -251,14 +366,31 @@ int pe_run(const rd_file_t *f)
     proc.name = f->name;
     proc.image_base = base;
     proc.image_pages = pages;
+    strncpy(proc.cmdline, cmdline ? cmdline : f->name,
+            sizeof(proc.cmdline) - 1);
     current_process = &proc;
+
+    /* native-Windows-style: resolve DLL imports and patch the IAT */
+    bool win_style = false;
+    err = resolve_imports(base, &pe, &win_style);
+    if (err) {
+        kprintf("exec: %s: %s\n", f->name, err);
+        current_process = NULL;
+        goto fail_unmap; /* mapped == pages here; frees everything */
+    }
 
     int jmp = k_setjmp(proc.exit_jmp);
     if (jmp == 0) {
-        typedef int (*entry_fn)(const alpha_api_t *);
-        entry_fn entry = (entry_fn)(base + pe.opt->entry_point);
+        u32 entry = base + pe.opt->entry_point;
         proc.running = true;
-        proc.exit_code = entry(api_table());
+        if (win_style)
+            /* Windows convention: entry takes no args; the program
+               talks to the OS purely through its imports */
+            proc.exit_code = ((int (*)(void))entry)();
+        else
+            /* legacy AlphaOS convention: API table on the stack */
+            proc.exit_code =
+                ((int (*)(const alpha_api_t *))entry)(api_table());
     }
     /* jmp==1: app called exit(); jmp==2: app crashed and was killed */
     proc.running = false;

@@ -67,19 +67,29 @@ static void cmd_uptime(void)
             pit_ticks());
 }
 
-static void cmd_run(const char *name)
+static void cmd_run(const char *cmdline)
 {
-    if (!*name) {
-        kprint("usage: run <file.exe>\n");
+    if (!*cmdline) {
+        kprint("usage: run <file.exe> [args]\n");
         return;
     }
+    /* first word is the executable; the whole string becomes the
+       process command line (GetCommandLineA) */
+    char name[64];
+    u32 i = 0;
+    while (cmdline[i] && cmdline[i] != ' ' && i < sizeof(name) - 1) {
+        name[i] = cmdline[i];
+        i++;
+    }
+    name[i] = 0;
+
     rd_file_t *f = ramdisk_find(name);
     if (!f) {
         kprintf("run: %s: not found (try 'ls')\n", name);
         return;
     }
     u32 t0 = uptime_ms();
-    int code = pe_run(f);
+    int code = pe_run(f, cmdline);
     kprintf("[os] %s exited with code %d (%u ms)\n",
             name, code, uptime_ms() - t0);
 }

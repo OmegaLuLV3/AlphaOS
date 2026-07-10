@@ -23,13 +23,18 @@ KLDFLAGS := -m elf_i386 -T kernel/linker.ld -nostdlib
 KOBJS := boot.o setjmp.o isr.o kernel.o console.o serial.o string.o \
          gdt.o idt.o pic.o pit.o keyboard.o pmm.o paging.o kheap.o \
          ramdisk.o pe.o api.o shell.o \
-         pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o
+         pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o win32.o
 KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------
 
 APPS     := hello sysinfo memhog primes crash paint
 APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
+
+# Windows-style apps: call the OS via PE imports (kernel32/user32)
+WINAPPS  := winhello msgbox
+WIN_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(WINAPPS)))
+IMPORTS  := apps/win32/imports.list
 
 .PHONY: all run run-vga test clean
 
@@ -64,8 +69,34 @@ $(BUILD)/apps/%.exe: $(BUILD)/apps/%.elf tools/mkpe.py
 	$(PYTHON) tools/mkpe.py $(BUILD)/apps/$*.bin $@ \
 	    --bss 0x$$(nm $< | awk '$$3=="__bss_size"{print $$1}')
 
-$(BUILD)/initrd.img: $(APP_EXES) tools/mkinitrd.py
-	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES)
+# ---- Windows-style pipeline: imports manifest -> IAT stubs -> PE ----
+
+$(BUILD)/apps/imports.S: $(IMPORTS) tools/mkimports.py | $(BUILD)/apps
+	$(PYTHON) tools/mkimports.py $(IMPORTS) $@
+
+$(BUILD)/apps/imports.o: $(BUILD)/apps/imports.S
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD)/apps/wincrt0.o: apps/win32/wincrt0.S | $(BUILD)/apps
+	$(CC) $(ASFLAGS) -c $< -o $@
+
+$(BUILD)/apps/%.wo: apps/win32/%.c apps/win32/win32.h | $(BUILD)/apps
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(BUILD)/apps/%.winelf: $(BUILD)/apps/%.wo $(BUILD)/apps/wincrt0.o \
+                        $(BUILD)/apps/imports.o apps/win32/winapp.ld
+	$(LD) -m elf_i386 -T apps/win32/winapp.ld -nostdlib -o $@ \
+	    $(BUILD)/apps/wincrt0.o $(BUILD)/apps/imports.o $<
+
+$(WIN_EXES): $(BUILD)/apps/%.exe: $(BUILD)/apps/%.winelf tools/mkpe.py \
+             $(IMPORTS)
+	$(OBJCOPY) -O binary $< $(BUILD)/apps/$*.bin
+	$(PYTHON) tools/mkpe.py $(BUILD)/apps/$*.bin $@ \
+	    --entry 0x1100 --imports $(IMPORTS) \
+	    --bss 0x$$(nm $< | awk '$$3=="__bss_size"{print $$1}')
+
+$(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) tools/mkinitrd.py
+	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES)
 
 # ---- run / test -----------------------------------------------------
 

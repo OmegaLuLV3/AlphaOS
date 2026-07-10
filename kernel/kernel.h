@@ -200,12 +200,19 @@ typedef struct process {
     u32         image_base;
     u32         image_pages;
     u32         heap_bytes;      /* live tracked bytes */
+    char        cmdline[128];    /* for GetCommandLineA */
+    u32         last_error;      /* for Get/SetLastError */
 } process_t;
 
 extern process_t *current_process;
 
-int  pe_run(const rd_file_t *file);      /* returns app exit code */
+/* cmdline may be NULL (defaults to the file name) */
+int  pe_run(const rd_file_t *file, const char *cmdline);
 void pe_info(const rd_file_t *file);     /* print PE headers */
+
+/* ---- win32.c: Win32-compatible export tables ------------------------- */
+void  win32_init(void);
+void *win_resolve(const char *dll, const char *func);
 
 /* ---- window manager (wm.c) ------------------------------------------ */
 #define WM_EVQ_SIZE 32
@@ -246,6 +253,8 @@ void console_use_gui(void);
 
 /* ---- api.c --------------------------------------------------------- */
 const alpha_api_t *api_table(void);
+void *proc_alloc(u32 size);             /* tracked per-process alloc */
+int   proc_free(void *ptr);             /* 1 if ptr was tracked */
 void  proc_release_all(process_t *p);
 
 /* ---- shell.c ------------------------------------------------------- */

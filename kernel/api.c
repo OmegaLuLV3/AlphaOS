@@ -11,7 +11,7 @@ typedef struct alloc_node {
     /* payload follows */
 } alloc_node_t;
 
-static void *api_alloc(unsigned int size)
+void *proc_alloc(u32 size)
 {
     if (!current_process || !size)
         return NULL;
@@ -25,10 +25,10 @@ static void *api_alloc(unsigned int size)
     return node + 1;
 }
 
-static void api_free(void *ptr)
+int proc_free(void *ptr)
 {
     if (!current_process || !ptr)
-        return;
+        return 0;
     alloc_node_t *node = (alloc_node_t *)ptr - 1;
     alloc_node_t **pp = (alloc_node_t **)&current_process->allocs;
     for (; *pp; pp = &(*pp)->next) {
@@ -36,10 +36,20 @@ static void api_free(void *ptr)
             *pp = node->next;
             current_process->heap_bytes -= node->size;
             kfree(node);
-            return;
+            return 1;
         }
     }
-    /* pointer not from api_alloc: ignore */
+    return 0; /* pointer not from proc_alloc: ignore */
+}
+
+static void *api_alloc(unsigned int size)
+{
+    return proc_alloc(size);
+}
+
+static void api_free(void *ptr)
+{
+    proc_free(ptr);
 }
 
 void proc_release_all(process_t *p)

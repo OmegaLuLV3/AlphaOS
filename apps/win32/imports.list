@@ -1,0 +1,7 @@
+# DLL imports available to Windows-style AlphaOS programs.
+# Format: <dll name> followed by its imported functions, one dll per line.
+# tools/mkimports.py turns this into IAT slots + call trampolines, and
+# tools/mkpe.py builds the matching PE import directory — keep the two
+# in sync by always generating both from this file.
+kernel32.dll ExitProcess GetStdHandle WriteConsoleA WriteFile ReadConsoleA Sleep GetTickCount VirtualAlloc VirtualFree GetProcessHeap HeapAlloc HeapFree GetCommandLineA GetLastError SetLastError LoadLibraryA GetProcAddress lstrlenA
+user32.dll MessageBoxA
