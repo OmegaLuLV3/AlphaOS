@@ -46,9 +46,14 @@ APPS     := hello sysinfo memhog primes crash paint noexec
 APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
 
 # Windows-style apps: call the OS via PE imports (kernel32/user32)
-WINAPPS  := winhello msgbox
+WINAPPS  := winhello msgbox readfile
 WIN_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(WINAPPS)))
 IMPORTS  := apps/win32/imports.list
+
+# data files packed onto the ramdisk as-is (not .exe's) -- readfile.exe
+# reads this one back via CreateFileA/ReadFile to prove real Win32 file
+# I/O against the (read-only) ramdisk
+DATA_FILES := apps/win32/data.txt
 
 # ---- compat: real third-party-toolchain binaries, built only if a
 # mingw-w64 cross compiler is present, to regression-test Win32
@@ -56,7 +61,8 @@ IMPORTS  := apps/win32/imports.list
 # produce. Silently skipped otherwise — never required for `make`.
 MINGW_CC := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 ifneq ($(MINGW_CC),)
-COMPAT_EXES := $(BUILD)/apps/mingw_hello.exe $(BUILD)/apps/mingw_winapp.exe
+COMPAT_EXES := $(BUILD)/apps/mingw_hello.exe $(BUILD)/apps/mingw_winapp.exe \
+               $(BUILD)/apps/mingw_readfile.exe
 endif
 
 .PHONY: all run run-vga test clean
@@ -124,8 +130,13 @@ $(BUILD)/apps/mingw_hello.exe: compat/mingw_hello.c | $(BUILD)/apps
 $(BUILD)/apps/mingw_winapp.exe: compat/mingw_winapp.c | $(BUILD)/apps
 	$(MINGW_CC) -O2 -mwindows -o $@ $<
 
-$(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES) tools/mkinitrd.py
-	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES)
+$(BUILD)/apps/mingw_readfile.exe: compat/mingw_readfile.c | $(BUILD)/apps
+	$(MINGW_CC) -O2 -o $@ $<
+
+$(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES) $(DATA_FILES) \
+                      tools/mkinitrd.py
+	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES) \
+	    $(DATA_FILES)
 
 # ---- bootable ISO -----------------------------------------------------
 #

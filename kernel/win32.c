@@ -56,12 +56,6 @@ static int WINAPI w_WriteConsoleA(void *handle, const void *buf, u32 len,
     return 1;
 }
 
-static int WINAPI w_WriteFile(void *handle, const void *buf, u32 len,
-                              u32 *written, void *overlapped)
-{
-    return w_WriteConsoleA(handle, buf, len, written, overlapped);
-}
-
 static int WINAPI w_ReadConsoleA(void *handle, void *buf, u32 max,
                                  u32 *read, void *reserved)
 {
@@ -76,6 +70,139 @@ static int WINAPI w_ReadConsoleA(void *handle, void *buf, u32 max,
     if (read)
         *read = n + 2;
     return 1;
+}
+
+/*
+ * ---- file I/O (kernel32), backed directly by the read-only ramdisk --
+ *
+ * AlphaOS has no writable filesystem, so CreateFileA only ever succeeds
+ * for OPEN_EXISTING + GENERIC_READ against a name that's actually on
+ * the ramdisk (ramdisk.c) — every other combination (create, write,
+ * delete, a name that doesn't exist) fails the call, the same way a
+ * real CreateFileA fails against a read-only volume it lacks
+ * permission on, rather than silently pretending to succeed. A
+ * fixed-size handle table (reset per process, same pattern as
+ * win_classes/hwnd_states above) tracks each open rd_file_t and read
+ * position; handles live at a small fixed address range distinct from
+ * every other magic handle value in this file (std handles 0x10-0x12,
+ * the heap handle 0xA1FA, cursor/icon 0x1 — real HWND/GDI handles are
+ * actual heap pointers, always far above this range).
+ */
+#define GENERIC_READ         0x80000000u
+#define OPEN_EXISTING        3u
+#define FILE_BEGIN           0u
+#define FILE_CURRENT         1u
+#define FILE_END             2u
+#define INVALID_HANDLE_VALUE ((void *)(uptr)-1)
+#define MAX_OPEN_FILES 8
+#define FILE_HANDLE_BASE 0x2000u
+
+typedef struct {
+    bool             used;
+    const rd_file_t *file;
+    u32              pos;
+} open_file_t;
+
+static open_file_t open_files[MAX_OPEN_FILES];
+
+static void win32_reset_file_state(void)
+{
+    memset(open_files, 0, sizeof(open_files));
+}
+
+static open_file_t *find_open_file(void *handle)
+{
+    uptr h = (uptr)handle;
+    if (h < FILE_HANDLE_BASE || h >= FILE_HANDLE_BASE + MAX_OPEN_FILES)
+        return NULL;
+    open_file_t *of = &open_files[h - FILE_HANDLE_BASE];
+    return of->used ? of : NULL;
+}
+
+static void *WINAPI w_CreateFileA(const char *path, u32 access, u32 share,
+                                   void *sec_attrs, u32 disposition,
+                                   u32 flags, void *template_file)
+{
+    (void)share; (void)sec_attrs; (void)flags; (void)template_file;
+    if (!path || disposition != OPEN_EXISTING || !(access & GENERIC_READ))
+        return INVALID_HANDLE_VALUE;
+    const rd_file_t *f = ramdisk_find(path);
+    if (!f)
+        return INVALID_HANDLE_VALUE;
+    for (u32 i = 0; i < MAX_OPEN_FILES; i++) {
+        if (!open_files[i].used) {
+            open_files[i].used = true;
+            open_files[i].file = f;
+            open_files[i].pos = 0;
+            return (void *)(uptr)(FILE_HANDLE_BASE + i);
+        }
+    }
+    return INVALID_HANDLE_VALUE; /* handle table full */
+}
+
+static int WINAPI w_ReadFile(void *handle, void *buf, u32 to_read,
+                             u32 *read_out, void *overlapped)
+{
+    open_file_t *of = find_open_file(handle);
+    if (!of) /* not one of ours: treat like console input, same shortcut
+                WriteFile below takes for console output */
+        return w_ReadConsoleA(handle, buf, to_read, read_out, overlapped);
+    (void)overlapped;
+    u32 remain = of->file->size - of->pos;
+    u32 n = to_read < remain ? to_read : remain;
+    memcpy(buf, of->file->data + of->pos, n);
+    of->pos += n;
+    if (read_out)
+        *read_out = n;
+    return 1;
+}
+
+static int WINAPI w_WriteFile(void *handle, const void *buf, u32 len,
+                              u32 *written, void *overlapped)
+{
+    if (find_open_file(handle)) {
+        /* ramdisk is read-only -- see this section's header comment */
+        if (written)
+            *written = 0;
+        return 0;
+    }
+    return w_WriteConsoleA(handle, buf, len, written, overlapped);
+}
+
+static int WINAPI w_CloseHandle(void *handle)
+{
+    open_file_t *of = find_open_file(handle);
+    if (of) {
+        of->used = false;
+        of->file = NULL;
+    }
+    return 1; /* closing a non-file handle is a harmless no-op success */
+}
+
+static u32 WINAPI w_GetFileSize(void *handle, u32 *high)
+{
+    open_file_t *of = find_open_file(handle);
+    if (!of)
+        return (u32)-1;
+    if (high)
+        *high = 0;
+    return of->file->size;
+}
+
+static u32 WINAPI w_SetFilePointer(void *handle, s32 distance, s32 *high,
+                                   u32 method)
+{
+    (void)high;
+    open_file_t *of = find_open_file(handle);
+    if (!of)
+        return (u32)-1;
+    s64 base = method == FILE_END ? (s64)of->file->size
+             : method == FILE_CURRENT ? (s64)of->pos : 0;
+    s64 newpos = base + distance;
+    if (newpos < 0 || newpos > (s64)of->file->size)
+        return (u32)-1;
+    of->pos = (u32)newpos;
+    return of->pos;
 }
 
 static void WINAPI w_Sleep(u32 ms)
@@ -993,6 +1120,8 @@ void win32_reset_process_state(void)
     win32_reset_gui_state(); /* stale window classes/HWNDs from a prior
                                  win-style process must not leak into
                                  this one — see the GUI section comment */
+    win32_reset_file_state(); /* stale open-file handles/positions from
+                                  a prior process must not leak either */
     acmdln_storage = current_process ? current_process->cmdline : NULL;
 }
 
@@ -1260,6 +1389,7 @@ static const win_export_t kernel32_exports[] = {
     { "GetStdHandle",    w_GetStdHandle },
     { "WriteConsoleA",   w_WriteConsoleA },
     { "WriteFile",       w_WriteFile },
+    { "ReadFile",        w_ReadFile },
     { "ReadConsoleA",    w_ReadConsoleA },
     { "Sleep",           w_Sleep },
     { "GetTickCount",    w_GetTickCount },
@@ -1285,6 +1415,10 @@ static const win_export_t kernel32_exports[] = {
     { "SetUnhandledExceptionFilter", w_SetUnhandledExceptionFilter },
     { "GetModuleHandleA", w_GetModuleHandleA },
     { "GetStartupInfoA",  w_GetStartupInfoA },
+    { "CreateFileA",      w_CreateFileA },
+    { "CloseHandle",      w_CloseHandle },
+    { "GetFileSize",      w_GetFileSize },
+    { "SetFilePointer",   w_SetFilePointer },
     /* LoadLibraryA / GetProcAddress defined below (need the tables) */
     { "LoadLibraryA",    NULL },
     { "GetProcAddress",  NULL },

@@ -40,6 +40,13 @@ typedef DWORD         *LPDWORD;
 #define IDOK     1
 #define IDCANCEL 2
 
+#define GENERIC_READ         0x80000000u
+#define OPEN_EXISTING        3u
+#define FILE_BEGIN           0u
+#define FILE_CURRENT         1u
+#define FILE_END             2u
+#define INVALID_HANDLE_VALUE ((HANDLE)(SIZE_T)-1)
+
 /* kernel32.dll */
 void    WINAPI ExitProcess(DWORD code);
 HANDLE  WINAPI GetStdHandle(DWORD which);
@@ -63,6 +70,15 @@ void    WINAPI SetLastError(DWORD err);
 HMODULE WINAPI LoadLibraryA(LPCSTR name);
 LPVOID  WINAPI GetProcAddress(HMODULE module, LPCSTR name);
 int     WINAPI lstrlenA(LPCSTR s);
+HANDLE  WINAPI CreateFileA(LPCSTR path, DWORD access, DWORD share,
+                           LPVOID sec_attrs, DWORD disposition,
+                           DWORD flags, HANDLE template_file);
+BOOL    WINAPI ReadFile(HANDLE h, LPVOID buf, DWORD to_read,
+                        LPDWORD read_out, LPVOID overlapped);
+BOOL    WINAPI CloseHandle(HANDLE h);
+DWORD   WINAPI GetFileSize(HANDLE h, LPDWORD high);
+DWORD   WINAPI SetFilePointer(HANDLE h, int distance, int *high,
+                              DWORD method);
 
 /* user32.dll */
 int     WINAPI MessageBoxA(HWND hwnd, LPCSTR text, LPCSTR caption,

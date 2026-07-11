@@ -19,7 +19,8 @@ feed() {
     for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
                "peinfo winhello.exe" "run winhello.exe with args" \
-               "run crash.exe" "run noexec.exe" "run nope.exe" \
+               "run crash.exe" "run noexec.exe" "run readfile.exe" \
+               "run nope.exe" \
                "echo still alive" \
                "lspci" "date" "mem" "uptime"; do
         printf '%s\n' "$cmd"
@@ -27,6 +28,8 @@ feed() {
     done
     if [ "$HAVE_MINGW" = 1 ]; then
         printf 'run mingw_hello.exe\n'
+        sleep 1.5
+        printf 'run mingw_readfile.exe\n'
         sleep 1.5
         # mingw_winapp.exe is a real GUI app with a GetMessageA message
         # loop that only ends on a mouse click on its close button —
@@ -59,7 +62,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.6"
+check "AlphaOS 0.7"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -93,12 +96,20 @@ check "crash.exe exited with code -1"
 check "about to jump into heap-allocated bytes"    # noexec.exe started
 check "killing process 'noexec.exe'"               # heap is really NX: the
 check "noexec.exe exited with code -1"             # ret stub faulted, didn't run
+# real Win32 file I/O (CreateFileA/ReadFile/GetFileSize/SetFilePointer),
+# backed by the read-only ramdisk
+check "data.txt is 49 bytes"
+check "contents: The quick brown fox jumps over the lazy ramdisk."
+check "seeked read at offset 10: brown"
+check "CreateFileA on a missing file correctly failed"
 check "not found"                                  # run nope.exe error path
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command
 if [ "$HAVE_MINGW" = 1 ]; then
     check "hello from a REAL mingw-w64 compiled Windows binary"
     check "mingw_hello.exe exited with code 0"         # genuine 3rd-party .exe ran
+    check "mingw_readfile: real Win32 file I/O read: The quick brown fox"
+    check "mingw_readfile.exe exited with code 0"      # real .exe read a real file
     check "imports        USER32.dll: BeginPaint"      # real GUI app's import table parses
     check "imports        GDI32.dll: TextOutA"
 else

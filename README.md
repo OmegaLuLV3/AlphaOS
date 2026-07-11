@@ -8,7 +8,7 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.6 -- a lightweight OS that runs .exe files
+  AlphaOS 0.7 -- a lightweight OS that runs .exe files
   130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
@@ -78,11 +78,17 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   stack) — so a real Windows toolchain binary built against this
   subset would call in correctly. Implemented subset: `ExitProcess`,
   `GetStdHandle`, `WriteConsoleA`, `WriteFile`, `ReadConsoleA`,
+  `ReadFile`, `CreateFileA`/`CloseHandle`/`GetFileSize`/`SetFilePointer`,
   `Sleep`, `GetTickCount`, `VirtualAlloc`/`VirtualFree`,
   `GetProcessHeap`, `HeapAlloc`/`HeapFree`, `GetCommandLineA`,
   `GetLastError`/`SetLastError`, `LoadLibraryA`, `GetProcAddress`,
   `lstrlenA`, and `user32.dll!MessageBoxA` — which draws a real modal
-  dialog with an OK button. Unresolved imports fail the load with the
+  dialog with an OK button. Real file I/O is backed directly by the
+  ramdisk: `CreateFileA` only succeeds for `OPEN_EXISTING` +
+  `GENERIC_READ` against a file that's actually there — no writable
+  filesystem exists, so create/write/delete fail the same way a real
+  `CreateFileA` fails against a read-only volume, rather than silently
+  pretending to succeed. Unresolved imports fail the load with the
   missing `dll!symbol` named. Legacy AlphaOS-API programs (no imports)
   still run; the loader picks the convention per binary.
 - **Real Win32 GUI apps, not just AlphaOS's own** — a `user32.dll`/
@@ -198,7 +204,7 @@ for AlphaOS itself.
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (41 assertions)
+make test     # scripted end-to-end boot test (47 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -241,8 +247,10 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `paint.exe` | **GUI app**: opens its own window, mouse drawing, palette |
 | `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
 | `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |
+| `readfile.exe` | **Windows-style**: real file I/O — `CreateFileA`/`ReadFile`/`SetFilePointer`/`GetFileSize`/`CloseHandle` against a ramdisk file |
 | `compat/mingw_hello.c` → `mingw_hello.exe` | **real third-party binary**: unmodified default `x86_64-w64-mingw32-gcc` output, full CRT — built only if mingw-w64 is installed |
 | `compat/mingw_winapp.c` → `mingw_winapp.exe` | **real third-party GUI binary**: unmodified `-mwindows` mingw-w64 output — `RegisterClassA`/`CreateWindowExA`/message loop/`TextOutA` — built only if mingw-w64 is installed |
+| `compat/mingw_readfile.c` → `mingw_readfile.exe` | **real third-party binary**: unmodified mingw-w64 output reading a real file back via `CreateFileA`/`ReadFile` — built only if mingw-w64 is installed |
 
 ## How a `.exe` is born and executed
 
@@ -287,18 +295,21 @@ paging, validation, and exception recovery rather than privilege levels.
 
 Scope note: AlphaOS implements the Win32 *mechanism* (PE32+ imports,
 the real Microsoft x64 ABI, IAT patching) and a useful, growing API
-subset — kernel32 CRT startup support, a `msvcrt.dll` runtime, and a
-`user32.dll`/`gdi32.dll` window/message subsystem. A program written
-against this subset — including an unmodified, default-flags
-mingw-w64 build with full CRT startup, and including GUI apps that
-open real windows and paint through GDI — runs as-is, calling
-convention and all (`compat/mingw_hello.c`, `compat/mingw_winapp.c`).
-Arbitrary off-the-shelf Windows software still generally won't: the
-full Win32 surface (files, registry, threads, networking, COM, richer
-GDI/USER32, ...) is a Wine-sized project, and this subset is far from
-that. Unsupported imports are reported by name at load time — see
-`peinfo` on a real Windows binary for a demonstration of exactly how
-far the loader gets before it needs something AlphaOS doesn't provide.
+subset — kernel32 CRT startup support, a `msvcrt.dll` runtime, a
+`user32.dll`/`gdi32.dll` window/message subsystem, and real
+(read-only) file I/O against the ramdisk. A program written against
+this subset — including an unmodified, default-flags mingw-w64 build
+with full CRT startup, GUI apps that open real windows and paint
+through GDI, and apps that read real files back with `CreateFileA`/
+`ReadFile` — runs as-is, calling convention and all
+(`compat/mingw_hello.c`, `compat/mingw_winapp.c`,
+`compat/mingw_readfile.c`). Arbitrary off-the-shelf Windows software
+still generally won't: the full Win32 surface (a writable filesystem,
+registry, threads, networking, COM, richer GDI/USER32, ...) is a
+Wine-sized project, and this subset is far from that. Unsupported
+imports are reported by name at load time — see `peinfo` on a real
+Windows binary for a demonstration of exactly how far the loader gets
+before it needs something AlphaOS doesn't provide.
 
 ## Layout
 
@@ -311,10 +322,10 @@ kernel/   boot.S (long-mode transition), GDT/IDT (64-bit), drivers
           terminal, shell
 apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
           Windows-style runtime (win32.h, wincrt0.S, imports.list)
-compat/   mingw_hello.c, mingw_winapp.c — built by a real mingw-w64
-          cross compiler, not AlphaOS's own toolchain, to
-          regression-test genuine third-party Win32 console + GUI
-          binary compatibility
+compat/   mingw_hello.c, mingw_winapp.c, mingw_readfile.c — built by a
+          real mingw-w64 cross compiler, not AlphaOS's own toolchain,
+          to regression-test genuine third-party Win32 console + GUI +
+          file I/O binary compatibility
 boot/     grub.cfg for the bootable ISO
 tools/    mkpe.py (flat binary → PE32+ w/ import tables), mkimports.py,
           mkinitrd.py, run_tests.sh, ai_bridge.py (host half of `ai`)

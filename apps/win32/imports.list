@@ -3,5 +3,5 @@
 # tools/mkimports.py turns this into IAT slots + call trampolines, and
 # tools/mkpe.py builds the matching PE import directory — keep the two
 # in sync by always generating both from this file.
-kernel32.dll ExitProcess GetStdHandle WriteConsoleA WriteFile ReadConsoleA Sleep GetTickCount VirtualAlloc VirtualFree GetProcessHeap HeapAlloc HeapFree GetCommandLineA GetLastError SetLastError LoadLibraryA GetProcAddress lstrlenA
+kernel32.dll ExitProcess GetStdHandle WriteConsoleA WriteFile ReadConsoleA Sleep GetTickCount VirtualAlloc VirtualFree GetProcessHeap HeapAlloc HeapFree GetCommandLineA GetLastError SetLastError LoadLibraryA GetProcAddress lstrlenA CreateFileA ReadFile CloseHandle GetFileSize SetFilePointer
 user32.dll MessageBoxA

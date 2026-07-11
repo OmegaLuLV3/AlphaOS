@@ -294,7 +294,7 @@ fetch bit set) — caught immediately by `make test` going from 38/0 to
 
 ## Verification
 
-Beyond `make test` (41 assertions, including the malicious-file checks
+Beyond `make test` (47 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 
@@ -322,6 +322,17 @@ containment, not just rejection.
   format path anywhere in the kernel. A compromised or buggy process —
   or the AI assistant, see below — cannot introduce new code or persist
   anything; every reboot starts from the exact image that was built.
+  The kernel32 file API added for real Win32 file I/O
+  (`CreateFileA`/`ReadFile`/`GetFileSize`/`SetFilePointer`/
+  `CloseHandle`, `win32.c`) is deliberately built on top of this
+  guarantee rather than around it: `CreateFileA` only ever succeeds for
+  `OPEN_EXISTING` + `GENERIC_READ` against a name `ramdisk_find()`
+  actually has — no `CREATE_ALWAYS`/`OPEN_ALWAYS`, no `GENERIC_WRITE`,
+  and `WriteFile` on an open file handle fails outright (see
+  `w_WriteFile`) — so this new surface cannot become the write/persist
+  path this bullet says doesn't exist. Handles live in a small
+  fixed-size table reset per process, the same pattern as the window
+  subsystem below.
 - **Per-process resource tracking.** Every `alloc`/`VirtualAlloc`/
   `HeapAlloc`/`malloc`/`calloc` call is tracked per-process and reclaimed
   on exit or crash — a crashing or malicious process cannot leak kernel
