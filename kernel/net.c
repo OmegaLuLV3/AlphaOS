@@ -71,6 +71,7 @@ static u8   irq_line;
 
 static const u8 our_ip[4]      = { 10, 0, 2, 15 };
 static const u8 gateway_ip[4]  = { 10, 0, 2, 2 };
+static const u8 dns_server_ip[4] = { 10, 0, 2, 3 }; /* SLIRP's DNS proxy */
 static const u8 bcast_mac[6]   = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
 /* ---- byte-order helpers: only 16-bit protocol fields need swapping
@@ -235,37 +236,53 @@ bool net_arp_resolve(const u8 ip[4], u8 mac_out[6])
 
 #define IP_HDR_LEN   20
 #define IP_PROTO_ICMP 1
+#define IP_PROTO_UDP  17
 #define ICMP_ECHO_REQUEST 8
 #define ICMP_ECHO_REPLY   0
+#define IP_PAYLOAD_MAX 512 /* plenty for ICMP echo and DNS queries/replies */
 
-static void icmp_send(const u8 dst_ip[4], u8 type, u16 id, u16 seq,
-                      const u8 *data, u32 data_len)
+/* Builds and sends an IPv4 header + the given already-built payload
+   (ICMP or UDP, whichever proto says) to dst_ip, resolving the
+   next-hop MAC via ARP first. Shared by icmp_send() and udp_send() so
+   the IP header construction/checksum logic exists in exactly one
+   place. */
+static void ip_send(const u8 dst_ip[4], u8 proto, const u8 *payload,
+                    u32 payload_len)
 {
     u8 mac[6];
     if (!net_arp_resolve(dst_ip, mac))
         return;
+    if (payload_len > IP_PAYLOAD_MAX)
+        return;
 
-    u8 buf[IP_HDR_LEN + 8 + 32];
-    u32 icmp_len = 8 + data_len;
-    if (icmp_len > sizeof(buf) - IP_HDR_LEN)
-        icmp_len = sizeof(buf) - IP_HDR_LEN;
-    if (data_len > icmp_len - 8)
-        data_len = icmp_len - 8;
-
+    u8 buf[IP_HDR_LEN + IP_PAYLOAD_MAX];
     u8 *ip = buf;
     ip[0] = 0x45; /* version 4, IHL 5 (20 bytes, no options) */
     ip[1] = 0;
-    *(u16 *)(ip + 2) = htons(IP_HDR_LEN + icmp_len);
+    *(u16 *)(ip + 2) = htons(IP_HDR_LEN + payload_len);
     *(u16 *)(ip + 4) = htons(1); /* identification */
     *(u16 *)(ip + 6) = 0;        /* flags/fragment offset */
     ip[8] = 64;                  /* TTL */
-    ip[9] = IP_PROTO_ICMP;
+    ip[9] = proto;
     *(u16 *)(ip + 10) = 0;       /* checksum, filled below */
     memcpy(ip + 12, our_ip, 4);
     memcpy(ip + 16, dst_ip, 4);
     *(u16 *)(ip + 10) = htons(checksum16(ip, IP_HDR_LEN));
 
-    u8 *icmp = buf + IP_HDR_LEN;
+    memcpy(buf + IP_HDR_LEN, payload, payload_len);
+    eth_send(mac, ETHERTYPE_IPV4, buf, IP_HDR_LEN + payload_len);
+}
+
+static void icmp_send(const u8 dst_ip[4], u8 type, u16 id, u16 seq,
+                      const u8 *data, u32 data_len)
+{
+    u8 icmp[8 + 32];
+    u32 icmp_len = 8 + data_len;
+    if (icmp_len > sizeof(icmp))
+        icmp_len = sizeof(icmp);
+    if (data_len > icmp_len - 8)
+        data_len = icmp_len - 8;
+
     icmp[0] = type;
     icmp[1] = 0;
     *(u16 *)(icmp + 2) = 0; /* checksum, filled below */
@@ -274,7 +291,7 @@ static void icmp_send(const u8 dst_ip[4], u8 type, u16 id, u16 seq,
     memcpy(icmp + 8, data, data_len);
     *(u16 *)(icmp + 2) = htons(checksum16(icmp, icmp_len));
 
-    eth_send(mac, ETHERTYPE_IPV4, buf, IP_HDR_LEN + icmp_len);
+    ip_send(dst_ip, IP_PROTO_ICMP, icmp, icmp_len);
 }
 
 static void icmp_handle(const u8 src_ip[4], const u8 *pkt, u32 len)
@@ -296,6 +313,84 @@ static void icmp_handle(const u8 src_ip[4], const u8 *pkt, u32 len)
             ping_reply_seen = true;
         }
     }
+}
+
+/* ---- UDP ---------------------------------------------------------------- */
+
+#define UDP_HDR_LEN 8
+
+/* single-outstanding-request model, same as the ping_expect_/
+   ping_reply_ fields above -- AlphaOS only ever runs one blocking
+   network call at a time, so one slot is all that's needed rather
+   than a real socket table */
+static volatile bool udp_reply_seen;
+static u16           udp_expect_local_port;
+static u8            udp_reply_buf[512];
+static volatile u32  udp_reply_len;
+
+static void udp_send(const u8 dst_ip[4], u16 dst_port, u16 src_port,
+                     const u8 *data, u32 data_len)
+{
+    u8 buf[IP_PAYLOAD_MAX];
+    u32 udp_len = UDP_HDR_LEN + data_len;
+    if (udp_len > sizeof(buf))
+        return;
+
+    *(u16 *)(buf + 0) = htons(src_port);
+    *(u16 *)(buf + 2) = htons(dst_port);
+    *(u16 *)(buf + 4) = htons(udp_len);
+    *(u16 *)(buf + 6) = 0; /* checksum: 0 = not computed, valid per RFC 768 */
+    memcpy(buf + UDP_HDR_LEN, data, data_len);
+
+    ip_send(dst_ip, IP_PROTO_UDP, buf, udp_len);
+}
+
+static void udp_handle(const u8 *pkt, u32 len)
+{
+    if (len < UDP_HDR_LEN)
+        return;
+    u16 dst_port = ntohs(*(const u16 *)(pkt + 2));
+    u16 udp_len  = ntohs(*(const u16 *)(pkt + 4));
+    if (udp_len < UDP_HDR_LEN || udp_len > len)
+        return; /* self-inconsistent or truncated-on-the-wire */
+
+    if (dst_port != udp_expect_local_port)
+        return; /* not the reply we're waiting for */
+
+    u32 data_len = udp_len - UDP_HDR_LEN;
+    if (data_len > sizeof(udp_reply_buf))
+        data_len = sizeof(udp_reply_buf);
+    memcpy(udp_reply_buf, pkt + UDP_HDR_LEN, data_len);
+    udp_reply_len = data_len;
+    udp_reply_seen = true;
+}
+
+/* Sends `data` to dst_ip:dst_port from src_port and blocks (bounded)
+   for a UDP reply addressed back to src_port. Same one-shot,
+   single-outstanding-request polling pattern as net_ping(). */
+static bool udp_request(const u8 dst_ip[4], u16 dst_port, u16 src_port,
+                        const u8 *data, u32 data_len, u8 *reply_buf,
+                        u32 reply_buf_size, u32 *reply_len_out)
+{
+    if (!nic_present)
+        return false;
+
+    udp_expect_local_port = src_port;
+    udp_reply_seen = false;
+    udp_send(dst_ip, dst_port, src_port, data, data_len);
+
+    u32 start = uptime_ms();
+    while (uptime_ms() - start < 2000) {
+        if (udp_reply_seen) {
+            u32 n = udp_reply_len < reply_buf_size ? udp_reply_len
+                                                    : reply_buf_size;
+            memcpy(reply_buf, udp_reply_buf, n);
+            if (reply_len_out)
+                *reply_len_out = n;
+            return true;
+        }
+    }
+    return false;
 }
 
 static void ip_handle(const u8 *pkt, u32 len)
@@ -324,6 +419,8 @@ static void ip_handle(const u8 *pkt, u32 len)
 
     if (proto == IP_PROTO_ICMP)
         icmp_handle(src_ip, pkt + ihl, total_len - ihl);
+    else if (proto == IP_PROTO_UDP)
+        udp_handle(pkt + ihl, total_len - ihl);
 }
 
 /* ---- Ethernet dispatch + RX/IRQ ---------------------------------------- */
@@ -374,6 +471,135 @@ static void nic_irq(regs_t *r)
             cur_rx -= RX_BUF_LEN;
         outw(io_base + REG_CAPR, (u16)(cur_rx - 16));
     }
+}
+
+/* ---- DNS (minimal A-record resolver) ------------------------------------
+ *
+ * Talks to whatever DNS server QEMU SLIRP's "user" backend provides
+ * (10.0.2.3 by default -- SLIRP's own built-in proxy, which forwards
+ * to the host's real resolver) over UDP/53. Only handles a straight
+ * A-record lookup: one question, take the first A answer found. No
+ * caching, no retries beyond udp_request()'s single 2s timeout, no
+ * CNAME following, no AAAA.
+ */
+#define DNS_PORT       53
+#define DNS_LOCAL_PORT 53000
+#define DNS_HDR_LEN    12
+
+static u32 dns_encode_name(const char *host, u8 *out, u32 out_max)
+{
+    u32 pos = 0;
+    const char *label = host;
+    while (1) {
+        const char *p = label;
+        while (*p && *p != '.')
+            p++;
+        u32 label_len = (u32)(p - label);
+        if (label_len == 0 || label_len > 63 ||
+            pos + 1 + label_len + 1 > out_max)
+            return 0; /* empty label, over the 63-byte label cap, or
+                          the encoded name doesn't fit -- reject rather
+                          than write past `out` */
+        out[pos++] = (u8)label_len;
+        memcpy(out + pos, label, label_len);
+        pos += label_len;
+        if (!*p)
+            break;
+        label = p + 1;
+    }
+    /* root label (terminating zero byte): every iteration's bound
+       check above reserved room for this, including after the last
+       real label written, so this write is always in bounds */
+    out[pos++] = 0;
+    return pos;
+}
+
+/* Returns the offset just past a (possibly compressed) DNS name at
+   pkt[offset], or 0 on malformed/out-of-bounds input. Doesn't need to
+   follow a compression pointer's target -- a pointer is always
+   exactly 2 bytes at the location being skipped, regardless of what
+   it points to -- which sidesteps the classic "pointer loop" DNS
+   parser bug entirely rather than needing a jump-count guard against
+   it. */
+static u32 dns_skip_name(const u8 *pkt, u32 len, u32 offset)
+{
+    while (offset < len) {
+        u8 b = pkt[offset];
+        if (b == 0)
+            return offset + 1;
+        if ((b & 0xC0) == 0xC0)
+            return offset + 2 <= len ? offset + 2 : 0;
+        if (b & 0xC0)
+            return 0; /* reserved length-byte bits set: malformed */
+        offset += 1 + b;
+    }
+    return 0;
+}
+
+bool net_dns_resolve(const char *hostname, u8 ip_out[4])
+{
+    if (!nic_present)
+        return false;
+
+    u8 query[256];
+    static u16 query_counter;
+    u16 id = (u16)(uptime_ms() ^ (++query_counter * 0x9E37u));
+    *(u16 *)(query + 0) = htons(id);
+    *(u16 *)(query + 2) = htons(0x0100); /* standard query, recursion desired */
+    *(u16 *)(query + 4) = htons(1);      /* QDCOUNT */
+    *(u16 *)(query + 6) = 0;             /* ANCOUNT */
+    *(u16 *)(query + 8) = 0;             /* NSCOUNT */
+    *(u16 *)(query + 10) = 0;            /* ARCOUNT */
+
+    u32 name_len = dns_encode_name(hostname, query + DNS_HDR_LEN,
+                                   sizeof(query) - DNS_HDR_LEN - 4);
+    if (!name_len)
+        return false;
+    u32 qpos = DNS_HDR_LEN + name_len;
+    *(u16 *)(query + qpos) = htons(1);     /* QTYPE = A */
+    *(u16 *)(query + qpos + 2) = htons(1); /* QCLASS = IN */
+    u32 query_len = qpos + 4;
+
+    u8 reply[512];
+    u32 reply_len = 0;
+    if (!udp_request(dns_server_ip, DNS_PORT, DNS_LOCAL_PORT, query,
+                     query_len, reply, sizeof(reply), &reply_len))
+        return false;
+
+    if (reply_len < DNS_HDR_LEN)
+        return false;
+    if (ntohs(*(u16 *)(reply + 0)) != id)
+        return false; /* not a reply to our query */
+    u16 flags = ntohs(*(u16 *)(reply + 2));
+    if (!(flags & 0x8000))
+        return false; /* QR bit clear: not a response */
+    u16 qdcount = ntohs(*(u16 *)(reply + 4));
+    u16 ancount = ntohs(*(u16 *)(reply + 6));
+
+    u32 offset = DNS_HDR_LEN;
+    for (u16 i = 0; i < qdcount; i++) {
+        offset = dns_skip_name(reply, reply_len, offset);
+        if (!offset || offset + 4 > reply_len)
+            return false;
+        offset += 4; /* QTYPE + QCLASS */
+    }
+
+    for (u16 i = 0; i < ancount; i++) {
+        offset = dns_skip_name(reply, reply_len, offset);
+        if (!offset || offset + 10 > reply_len)
+            return false; /* TYPE(2)+CLASS(2)+TTL(4)+RDLENGTH(2) */
+        u16 rtype = ntohs(*(u16 *)(reply + offset));
+        u16 rdlength = ntohs(*(u16 *)(reply + offset + 8));
+        offset += 10;
+        if (offset + rdlength > reply_len)
+            return false;
+        if (rtype == 1 && rdlength == 4) { /* A record */
+            memcpy(ip_out, reply + offset, 4);
+            return true;
+        }
+        offset += rdlength;
+    }
+    return false; /* no A record in the answer section */
 }
 
 /* ---- public API --------------------------------------------------------- */

@@ -424,9 +424,66 @@ real ICMP echo request, and receives a real ICMP echo reply, end to
 end through the RTL8139 TX ring, the IRQ-driven RX ring, and every
 parser above. `make test`: 54/54 passing.
 
+### 15. UDP + a minimal DNS client — same threat model as #14, extended
+to a new parser with its own classic bug class
+
+**Where:** `kernel/net.c`: `udp_handle()`, and the DNS resolver
+(`net_dns_resolve()`, `dns_skip_name()`, `dns_encode_name()`).
+
+Continues finding #14's threat model directly: `udp_handle()` and the
+DNS response parser run against bytes that arrived over the wire (via
+QEMU SLIRP's DNS proxy in normal use), so they're held to the same
+standard as everything above — bounds-checked against the real
+received length before any field is read, not against a length the
+packet itself claims.
+
+DNS specifically has its own well-known historical bug class beyond
+plain bounds-checking: **compressed name pointers that loop**, letting
+a malicious response spin a naive parser forever (or walk it endlessly
+around the packet re-reading the same bytes). `dns_skip_name()`
+sidesteps this class entirely rather than defending against it with a
+jump-count budget: it never actually *follows* a compression pointer's
+target at all. A pointer is always exactly 2 bytes at the location
+being skipped over (in the question section, or between answer
+records) — skipping past it needs to know it's a pointer and its
+fixed 2-byte width, never where it points. Since the resolver only
+ever needs the first A-record's 4-byte RDATA (not the record's own
+NAME field, which it never reads), there was no need to write a
+pointer-following name decoder — and therefore no pointer-loop
+surface to defend against, by construction rather than by a guard that
+could itself have an off-by-one.
+
+Every remaining length in the parser (`dns_skip_name`'s own bound,
+`qdcount`/`ancount` loop bounds against `reply_len`, `rdlength` against
+the remaining bytes before trusting an A record's RDATA) is checked
+the same defensive way as finding #14's IP/ICMP/UDP parsers — reject
+and stop rather than trust a self-reported length.
+
+**`udp_handle()`'s reply-matching is intentionally not a real socket
+table.** AlphaOS only ever runs one blocking network call at a time
+(`net_ping()`, `net_dns_resolve()` — never concurrently, by the same
+single-process-at-a-time design the rest of this codebase relies on),
+so a single `udp_expect_local_port`/`udp_reply_seen` pair does the job
+a socket table would. This is a scope note, not a vulnerability: there
+is currently no code path that could have two outstanding requests to
+confuse.
+
+**Verification:** `nslookup example.com` in this development
+environment resolved to a genuine external IP address end to end —
+`net_dns_resolve()`'s UDP query really left the RTL8139, QEMU SLIRP's
+DNS proxy really forwarded it to a real upstream resolver, and the
+real response (including whatever name compression a real-world
+resolver uses) was parsed correctly. `make test`'s automated check
+accepts either a real resolution *or* the resolver's own clean timeout
+message — deliberately, since (unlike `ping`, which only ever talks to
+QEMU's own virtual gateway) DNS resolution depends on the *test
+runner's* actual internet access, which this suite can't assume every
+environment has; a hang or a crash either way would still fail the
+suite. `make test`: 55/55 passing.
+
 ## Verification
 
-Beyond `make test` (54 assertions, including the malicious-file checks
+Beyond `make test` (55 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 
@@ -544,17 +601,23 @@ exist would be worse than naming them:
   files, not a mechanical sweep of every function in the kernel. Treat
   "audited" as "this specific surface was looked at carefully," not
   "this OS is safe against a motivated attacker."
-- **The network stack (finding #14) is intentionally minimal, not
+- **The network stack (findings #14/#15) is intentionally minimal, not
   hardened.** No TCP (so no port scanning/connection-flood surface
   exists yet, but also nothing useful can be built on top of it beyond
-  ping), no fragmentation reassembly, no DNS, no TLS. The IP
-  configuration is a single hardcoded static address matching QEMU's
-  SLIRP defaults — there's no DHCP client, so this driver only makes
-  sense against the exact backend the Makefile configures. Every
-  connection this eventually needs (an HTTP client, an auto-updater
-  pulling from GitHub) requires real transport and TLS layers that
-  don't exist yet; building those without inheriting classic C
-  network-stack vulnerability classes (TCP state-machine bugs, integer
-  overflows in reassembly, certificate-validation bypasses in a home-
-  grown TLS implementation) will need the same care this pass put into
-  finding #14, not less.
+  ping/DNS), no fragmentation reassembly, no TLS. DNS answers aren't
+  validated against the question beyond the transaction ID matching
+  and the QR bit being set — no 0x20 encoding, no strict source-port
+  randomization beyond the fixed `DNS_LOCAL_PORT`, which is fine
+  against a directly-connected, trusted SLIRP proxy but would not be
+  fine against an untrusted network path once this talks to a real
+  DNS server over a real link. The IP configuration is a single
+  hardcoded static address matching QEMU's SLIRP defaults — there's no
+  DHCP client, so this driver only makes sense against the exact
+  backend the Makefile configures. Every connection this eventually
+  needs (an HTTP client, an auto-updater pulling from GitHub) requires
+  a real TCP layer and TLS that don't exist yet; building those
+  without inheriting classic C network-stack vulnerability classes
+  (TCP state-machine bugs, integer overflows in reassembly,
+  certificate-validation bypasses in a home-grown TLS implementation)
+  will need the same care this pass put into findings #14/#15, not
+  less.

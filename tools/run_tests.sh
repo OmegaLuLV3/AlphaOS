@@ -29,6 +29,15 @@ feed() {
     done
     printf 'ping\n'
     sleep 3
+    # nslookup needs the *test runner's* real internet access (SLIRP
+    # forwards the DNS query to the host's actual resolver) -- unlike
+    # `ping`, which only ever talks to QEMU's own virtual gateway.
+    # Exercised here either way so a hang/crash would still be caught,
+    # but the check below accepts either a real answer or the clean
+    # "no answer" failure path, since this suite can't assume the
+    # environment running it has outbound DNS.
+    printf 'nslookup example.com\n'
+    sleep 3
     if [ "$HAVE_MINGW" = 1 ]; then
         printf 'run mingw_hello.exe\n'
         sleep 1.5
@@ -68,7 +77,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.9"
+check "AlphaOS 0.10"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -124,6 +133,10 @@ check "physical:"                                  # mem command
 # not a loopback shortcut
 check "pinging gateway 10.0.2.2"
 check "reply from 10.0.2.2: time="
+# nslookup: accept either a real resolution or the clean failure
+# message -- see the feed() comment above on why this can't require
+# an actual answer unconditionally
+check "example.com -> [0-9]\|nslookup: example.com: no answer"
 if [ "$HAVE_MINGW" = 1 ]; then
     check "hello from a REAL mingw-w64 compiled Windows binary"
     check "mingw_hello.exe exited with code 0"         # genuine 3rd-party .exe ran

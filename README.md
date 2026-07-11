@@ -8,7 +8,7 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.9 -- a lightweight OS that runs .exe files
+  AlphaOS 0.10 -- a lightweight OS that runs .exe files
   130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
@@ -139,26 +139,30 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   | `pit.c` | 8254 timer (IRQ 0) | 100 Hz tick, sleep, uptime |
   | `serial.c` | 16550 UART | full headless console + logs |
   | `font.c` | VGA | captures the BIOS 8×16 font for the GUI |
-  | `net.c` | Realtek RTL8139 NIC | Ethernet/ARP/IPv4/ICMP, `ping` |
+  | `net.c` | Realtek RTL8139 NIC | Ethernet/ARP/IPv4/ICMP/UDP/DNS, `ping`/`nslookup` |
 
   Balanced by design: if the display adapter is missing (e.g. unusual
   real hardware), the OS degrades gracefully to the VGA text-mode shell —
   every feature except windows still works. Same for the NIC: no RTL8139
   present, no network — everything else keeps working.
-- **A real network stack, first slice** — `net.c` drives an RTL8139 NIC
+- **A real network stack, growing** — `net.c` drives an RTL8139 NIC
   directly (PCI enable, ring-buffer RX/TX, IRQ-driven receive) and
-  implements just enough of Ethernet/ARP/IPv4/ICMP to send a real ping
-  and get a real reply: `ping` at the shell resolves the gateway's MAC
-  over ARP, sends an ICMP echo request, and reports the round trip —
-  genuinely over emulated hardware (QEMU's SLIRP backend), not a
-  loopback shortcut. This is the foundation step for two much bigger
-  asks (a browser, pulling updates from GitHub): both need a real
-  network stack under them before anything else is possible, so that's
-  what got built first. No TCP/DNS/TLS yet — see the roadmap below.
-  Every byte this parses comes off the wire untrusted, and it's
-  threat-modeled that way from the start; see `SECURITY.md` finding
-  #14, including a bug (an integer underflow in malformed-packet
-  handling) caught and fixed by adversarial review before this shipped.
+  implements Ethernet/ARP/IPv4/ICMP/UDP plus a minimal DNS resolver:
+  `ping` at the shell resolves the gateway's MAC over ARP, sends an
+  ICMP echo request, and reports the round trip; `nslookup <name>`
+  sends a real DNS query over UDP and parses a real response —
+  genuinely over emulated hardware (QEMU's SLIRP backend) all the way
+  out to a real upstream DNS resolver, not a loopback shortcut or a
+  mock. This is the foundation step for two much bigger asks (a
+  browser, pulling updates from GitHub): both need a real network
+  stack under them before anything else is possible, so that's what
+  got built first. No TCP/TLS yet — see the roadmap below. Every byte
+  this parses comes off the wire untrusted, and it's threat-modeled
+  that way from the start; see `SECURITY.md` findings #14 and #15,
+  including two bugs (an integer underflow in malformed IP-packet
+  handling, and — for DNS — a whole bug *class*, compression-pointer
+  loops, sidestepped by construction rather than patched after the
+  fact) caught and fixed by adversarial review before this shipped.
 - **Lightweight** — kernel ~5.3k lines of C/asm; the whole system boots
   to a composited desktop in well under a second.
 - **Resource management**
@@ -220,7 +224,7 @@ for AlphaOS itself.
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (54 assertions)
+make test     # scripted end-to-end boot test (55 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -338,9 +342,11 @@ JIT, and the full modern web platform; a GitHub-pulling updater needs
 somewhere persistent to write the update to). Both share the same hard
 prerequisite, so that's what's being built first:
 
-1. **Network stack foundation** — done, first slice: `net.c`'s RTL8139
-   driver + Ethernet/ARP/IPv4/ICMP (`ping`). Still needed: UDP, TCP.
-2. **DNS + a minimal HTTP client** — not started.
+1. **Network stack foundation** — in progress: `net.c`'s RTL8139 driver
+   + Ethernet/ARP/IPv4/ICMP/UDP (`ping`) and a minimal DNS resolver
+   (`nslookup`) are done. Still needed: TCP.
+2. **A minimal HTTP client** — not started; needs TCP from step 1
+   first. (DNS, the other half of this step, is already done above.)
 3. **TLS** — not started; almost everything on the modern web requires
    HTTPS, including GitHub's API and release downloads.
 4. **A disk driver + a real writable filesystem** — not started;
@@ -357,7 +363,9 @@ prerequisite, so that's what's being built first:
 Each step gets the same treatment as everything else in this repo:
 built against real protocols/formats, tested against real traffic (not
 mocked), and reviewed adversarially before being called done — see
-`SECURITY.md` finding #14 for how that played out for step 1.
+`SECURITY.md` findings #14 and #15 for how that played out for step 1
+so far (including a bounds bug and an entire bug *class* — DNS
+compression-pointer loops — each caught before shipping).
 
 ## Layout
 

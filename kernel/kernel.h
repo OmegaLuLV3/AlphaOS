@@ -132,6 +132,7 @@ void       net_init(void);
 bool       net_ready(void);
 bool       net_arp_resolve(const u8 ip[4], u8 mac_out[6]);
 bool       net_ping(const u8 ip[4], u32 *rtt_ms_out);
+bool       net_dns_resolve(const char *hostname, u8 ip_out[4]);
 const u8  *net_gateway_ip(void);
 const u8  *net_our_ip(void);
 

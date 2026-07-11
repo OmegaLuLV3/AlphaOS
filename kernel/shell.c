@@ -13,6 +13,7 @@ static void cmd_help(void)
            "  lspci           list devices on the PCI bus\n"
            "  date            read the real-time clock\n"
            "  ping            ping the network gateway (needs a NIC)\n"
+           "  nslookup <name> resolve a hostname via DNS (needs a NIC)\n"
            "  ai <question>   ask the AI assistant (needs ai_bridge.py)\n"
            "  uptime          time since boot\n"
            "  clear           clear the screen\n"
@@ -84,6 +85,24 @@ static void cmd_ping(void)
                 ip[3], rtt);
     else
         kprint("ping: no reply (timed out)\n");
+}
+
+static void cmd_nslookup(const char *hostname)
+{
+    if (!net_ready()) {
+        kprint("nslookup: no NIC (boot with -netdev user,id=net0 "
+               "-device rtl8139,netdev=net0)\n");
+        return;
+    }
+    if (!*hostname) {
+        kprint("usage: nslookup <hostname>\n");
+        return;
+    }
+    u8 ip[4];
+    if (net_dns_resolve(hostname, ip))
+        kprintf("%s -> %u.%u.%u.%u\n", hostname, ip[0], ip[1], ip[2], ip[3]);
+    else
+        kprintf("nslookup: %s: no answer (timed out or NXDOMAIN)\n", hostname);
 }
 
 static void cmd_run(const char *cmdline)
@@ -166,6 +185,8 @@ void shell_run(void)
             cmd_date();
         else if (strcmp(line, "ping") == 0)
             cmd_ping();
+        else if (strcmp(line, "nslookup") == 0)
+            cmd_nslookup(arg);
         else if (strcmp(line, "ai") == 0) {
             if (*arg)
                 ai_ask(arg);
