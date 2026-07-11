@@ -8,7 +8,7 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.7 -- a lightweight OS that runs .exe files
+  AlphaOS 0.8 -- a lightweight OS that runs .exe files
   130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
@@ -204,7 +204,7 @@ for AlphaOS itself.
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (47 assertions)
+make test     # scripted end-to-end boot test (51 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -248,6 +248,7 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
 | `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |
 | `readfile.exe` | **Windows-style**: real file I/O — `CreateFileA`/`ReadFile`/`SetFilePointer`/`GetFileSize`/`CloseHandle` against a ramdisk file |
+| `allocbomb.exe` | security regression: a ~4GiB `VirtualAlloc`/`HeapAlloc` now fails cleanly instead of wrapping into heap corruption (see `SECURITY.md` #13) |
 | `compat/mingw_hello.c` → `mingw_hello.exe` | **real third-party binary**: unmodified default `x86_64-w64-mingw32-gcc` output, full CRT — built only if mingw-w64 is installed |
 | `compat/mingw_winapp.c` → `mingw_winapp.exe` | **real third-party GUI binary**: unmodified `-mwindows` mingw-w64 output — `RegisterClassA`/`CreateWindowExA`/message loop/`TextOutA` — built only if mingw-w64 is installed |
 | `compat/mingw_readfile.c` → `mingw_readfile.exe` | **real third-party binary**: unmodified mingw-w64 output reading a real file back via `CreateFileA`/`ReadFile` — built only if mingw-w64 is installed |

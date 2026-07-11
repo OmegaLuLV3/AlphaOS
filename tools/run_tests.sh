@@ -20,6 +20,7 @@ feed() {
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
                "peinfo winhello.exe" "run winhello.exe with args" \
                "run crash.exe" "run noexec.exe" "run readfile.exe" \
+               "run allocbomb.exe" \
                "run nope.exe" \
                "echo still alive" \
                "lspci" "date" "mem" "uptime"; do
@@ -62,7 +63,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.7"
+check "AlphaOS 0.8"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -102,6 +103,13 @@ check "data.txt is 49 bytes"
 check "contents: The quick brown fox jumps over the lazy ramdisk."
 check "seeked read at offset 10: brown"
 check "CreateFileA on a missing file correctly failed"
+# proc_alloc() header-overflow fix (SECURITY.md #13): a ~4GiB request
+# must fail cleanly, not wrap to a tiny real allocation and corrupt
+# the heap
+check "VirtualAlloc correctly returned NULL"
+check "HeapAlloc correctly returned NULL"
+check "heap is intact after the rejected allocations"
+check "allocbomb.exe exited with code 0"
 check "not found"                                  # run nope.exe error path
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command

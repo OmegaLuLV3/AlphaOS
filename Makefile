@@ -46,7 +46,7 @@ APPS     := hello sysinfo memhog primes crash paint noexec
 APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
 
 # Windows-style apps: call the OS via PE imports (kernel32/user32)
-WINAPPS  := winhello msgbox readfile
+WINAPPS  := winhello msgbox readfile allocbomb
 WIN_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(WINAPPS)))
 IMPORTS  := apps/win32/imports.list
 

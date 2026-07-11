@@ -292,9 +292,70 @@ their very first instruction (`page fault ... err=11`, the instruction-
 fetch bit set) — caught immediately by `make test` going from 38/0 to
 27/11, fixed, and reverified before this was considered done.
 
+### 13. Integer-overflow-to-heap-corruption in `proc_alloc()` — a second,
+deeper truncation `checked_alloc()` didn't cover — **critical**
+
+**Where:** `kernel/api.c`, function `proc_alloc()`.
+
+Found by a dedicated adversarial review pass over the newest code
+(the file I/O and W^X additions above) that also re-examined the
+allocator path underneath them. `proc_alloc(u32 size)` computed its
+real allocation as:
+
+```c
+alloc_node_t *node = kmalloc(sizeof(alloc_node_t) + size);
+```
+
+`sizeof(alloc_node_t)` is a 64-bit `usize`, so the addition itself
+happens in 64-bit arithmetic — but `kmalloc()` takes a plain `u32`, so
+the 64-bit sum is silently truncated back to 32 bits *at the call
+site*. For any `size` within `sizeof(alloc_node_t)` (16 bytes) of
+`UINT32_MAX`, `16 + size` wraps past 2^32 and the truncated value
+passed to `kmalloc()` collapses to a tiny number (as low as 1).
+`kmalloc()` then succeeds with a real allocation of only a few bytes,
+and `proc_alloc()` proceeds as if it got the real, huge allocation it
+asked for:
+
+- `node->size = size` writes the caller's original (huge) size at
+  offset 8 of that tiny real block — a guaranteed out-of-bounds write
+  into the *next* block's header in `kheap.c`'s free list, corrupting
+  kernel heap metadata directly.
+- `return node + 1` hands back a pointer 16 bytes past `node` — which
+  doesn't even land inside the tiny real allocation.
+
+This is the same overflow-truncation bug *class* finding #7 fixed
+(`checked_alloc()`, `win32.c`), but a distinct, previously-unpatched
+instance one layer deeper: `checked_alloc()` only guards the size
+*argument* against exceeding `UINT32_MAX` before calling `proc_alloc()`
+— it has no way to know `proc_alloc()` does its own narrowing
+arithmetic internally, so a size like `0xFFFFFFF0` sails through
+`checked_alloc()` clean and hits this bug one function later.
+
+**Exploit path:** `VirtualAlloc(NULL, 0xFFFFFFF0, MEM_COMMIT, PAGE_READWRITE)`
+(or the `HeapAlloc`/`calloc` equivalents, or the native AlphaOS
+`os->alloc()` syscall directly) triggers the truncation. Worse,
+`w_VirtualAlloc`/`w_HeapAlloc` then unconditionally `memset()` the
+*original* (huge) size into the handful of real bytes actually
+allocated — a single call cascades into wiping out most or all of the
+16 MiB kernel heap before eventually walking off mapped memory.
+
+**Fix:** `proc_alloc()` now rejects any `size > UINT32_MAX -
+sizeof(alloc_node_t)` up front, before the addition that used to wrap
+is ever computed — the same "reject the oversized request instead of
+silently truncating it" approach `checked_alloc()` already used one
+layer up, just applied at the layer where the truncation actually
+happens.
+
+**Verification:** `apps/win32/allocbomb.c` requests a ~4 GiB
+`VirtualAlloc` and `HeapAlloc`, confirms both now return `NULL`
+instead of "succeeding," then performs a normal small `VirtualAlloc`
+immediately after and writes/reads through it — proving the heap
+wasn't left corrupted by the rejected calls, not just that the calls
+themselves were rejected. `make test`: 51/51 passing.
+
 ## Verification
 
-Beyond `make test` (47 assertions, including the malicious-file checks
+Beyond `make test` (51 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 

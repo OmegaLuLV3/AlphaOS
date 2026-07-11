@@ -15,6 +15,22 @@ void *proc_alloc(u32 size)
 {
     if (!current_process || !size)
         return NULL;
+    /* sizeof(alloc_node_t) + size is computed in 64-bit (sizeof() is
+       usize), but kmalloc() takes a u32 -- the call site silently
+       truncates that 64-bit sum back to 32 bits. For size within
+       sizeof(alloc_node_t) of UINT32_MAX, the truncated value wraps
+       to a tiny number: kmalloc() then succeeds with a real
+       allocation of only a few bytes, node->size = size below writes
+       the caller's full (huge) size into memory immediately past that
+       tiny block -- corrupting the next block's kheap.c header -- and
+       the node+1 pointer handed back to the caller doesn't even land
+       inside the real allocation. checked_alloc() (win32.c) only
+       guards the size argument itself against exceeding UINT32_MAX;
+       it doesn't know about this second, deeper truncation one layer
+       down. Reject here instead of ever computing the wrapped sum.
+       See SECURITY.md finding #13. */
+    if (size > 0xFFFFFFFFu - sizeof(alloc_node_t))
+        return NULL;
     alloc_node_t *node = kmalloc(sizeof(alloc_node_t) + size);
     if (!node)
         return NULL;
