@@ -277,7 +277,528 @@ static void *WINAPI w_GetModuleHandleA(const char *name)
     return current_process ? (void *)current_process->image_base : NULL;
 }
 
-/* ---- USER32 ---------------------------------------------------------- */
+/*
+ * STARTUPINFOA — deliberately not __attribute__((packed)): GCC applies
+ * the same x86-64 alignment rules MSVC/mingw do for the plain
+ * Microsoft ABI, so a natural (unpacked) layout here matches the real
+ * struct byte-for-byte, exactly like every other cross-toolchain
+ * struct in this file (opt_header_t in pe.c relies on the same fact).
+ */
+typedef struct {
+    u32 cb;
+    char *reserved;
+    char *desktop;
+    char *title;
+    u32 x, y, x_size, y_size;
+    u32 x_count_chars, y_count_chars;
+    u32 fill_attribute;
+    u32 flags;
+    u16 show_window;
+    u16 reserved2;
+    u8 *reserved2_ptr;
+    void *std_input, *std_output, *std_error;
+} startupinfo_a_t;
+
+static void WINAPI w_GetStartupInfoA(startupinfo_a_t *si)
+{
+    if (!si)
+        return;
+    memset(si, 0, sizeof(*si));
+    si->cb = sizeof(*si);
+    si->show_window = 1; /* SW_SHOWNORMAL */
+    si->std_input = (void *)0x10;
+    si->std_output = (void *)0x11;
+    si->std_error = (void *)0x12;
+}
+
+/* ---- USER32 / GDI32 ---------------------------------------------------
+ *
+ * A minimal but real window/message subsystem, backed directly by the
+ * existing window manager (wm.c) — the same compositor, taskbar, and
+ * mouse/keyboard pump that AlphaOS-native windowed apps (paint.exe) and
+ * MessageBoxA already use. A genuine RegisterClassA/CreateWindowExA/
+ * GetMessageA/DispatchMessageA-based Win32 GUI program calls into this
+ * exactly as it would call into real user32.dll/gdi32.dll, including
+ * having its WNDPROC invoked by DispatchMessageA with the real
+ * Microsoft x64 calling convention.
+ *
+ * Deliberately simplified relative to real Windows: one "device
+ * context" per window rather than a separate DC object model (HDC and
+ * HWND are literally the same value here — real app code never
+ * inspects an HDC's bit pattern, only passes it back opaquely, so this
+ * is safe), no window styles/menus/child windows, no TranslateMessage
+ * WM_CHAR synthesis. Enough to run real single-window GUI programs
+ * that paint with GDI text/rect calls and react to input — not enough
+ * to run anything with a nontrivial UI framework underneath it.
+ */
+
+typedef s64 (WINAPI *wndproc_t)(void *hwnd, u32 msg, u64 wparam, s64 lparam);
+
+#define WM_DESTROY      0x0002
+#define WM_CLOSE        0x0010
+#define WM_PAINT        0x000F
+#define WM_QUIT         0x0012
+#define WM_LBUTTONDOWN  0x0201
+#define WM_LBUTTONUP    0x0202
+#define WM_MOUSEMOVE    0x0200
+#define WM_KEYDOWN      0x0100
+#define WM_CHAR         0x0102
+
+#define MAX_WIN_CLASSES 16
+#define MAX_HWNDS       16
+
+typedef struct {
+    bool used;
+    char name[64];
+    wndproc_t wndproc;
+} win_class_t;
+
+typedef struct {
+    bool used;
+    window_t *win;
+    wndproc_t wndproc;
+    bool needs_paint;
+    u32 text_color; /* ARGB, set via SetTextColor */
+} hwnd_state_t;
+
+static win_class_t win_classes[MAX_WIN_CLASSES];
+static hwnd_state_t hwnd_states[MAX_HWNDS];
+static bool quit_posted;
+static int  quit_code;
+
+static void win32_reset_gui_state(void)
+{
+    memset(win_classes, 0, sizeof(win_classes));
+    memset(hwnd_states, 0, sizeof(hwnd_states));
+    quit_posted = false;
+    quit_code = 0;
+}
+
+static win_class_t *find_class(const char *name)
+{
+    if (!name)
+        return NULL;
+    for (u32 i = 0; i < MAX_WIN_CLASSES; i++)
+        if (win_classes[i].used && strcmp(win_classes[i].name, name) == 0)
+            return &win_classes[i];
+    return NULL;
+}
+
+static hwnd_state_t *find_hwnd(void *hwnd)
+{
+    for (u32 i = 0; i < MAX_HWNDS; i++)
+        if (hwnd_states[i].used && hwnd_states[i].win == hwnd)
+            return &hwnd_states[i];
+    return NULL;
+}
+
+/* WNDCLASSA — see the STARTUPINFOA comment above re: natural alignment */
+typedef struct {
+    u32 style;
+    wndproc_t wndproc;
+    s32 cls_extra, wnd_extra;
+    void *hinstance;
+    void *hicon;
+    void *hcursor;
+    void *hbrbackground;
+    const char *menu_name;
+    const char *class_name;
+} wndclass_a_t;
+
+static u16 WINAPI w_RegisterClassA(const wndclass_a_t *wc)
+{
+    if (!wc || !wc->class_name || find_class(wc->class_name))
+        return 0;
+    for (u32 i = 0; i < MAX_WIN_CLASSES; i++) {
+        if (!win_classes[i].used) {
+            win_classes[i].used = true;
+            strncpy(win_classes[i].name, wc->class_name,
+                    sizeof(win_classes[i].name) - 1);
+            win_classes[i].wndproc = wc->wndproc;
+            return 1; /* real RegisterClassA returns a nonzero ATOM */
+        }
+    }
+    return 0;
+}
+
+/* WNDCLASSEXA: WNDCLASSA's fields plus a leading cbSize and a trailing
+   hIconSm — RegisterClassExA just needs the same inner fields */
+typedef struct {
+    u32 cb_size;
+    u32 style;
+    wndproc_t wndproc;
+    s32 cls_extra, wnd_extra;
+    void *hinstance;
+    void *hicon;
+    void *hcursor;
+    void *hbrbackground;
+    const char *menu_name;
+    const char *class_name;
+    void *hicon_sm;
+} wndclassex_a_t;
+
+static u16 WINAPI w_RegisterClassExA(const wndclassex_a_t *wc)
+{
+    if (!wc)
+        return 0;
+    wndclass_a_t plain = {
+        .style = wc->style, .wndproc = wc->wndproc,
+        .cls_extra = wc->cls_extra, .wnd_extra = wc->wnd_extra,
+        .hinstance = wc->hinstance, .hicon = wc->hicon,
+        .hcursor = wc->hcursor, .hbrbackground = wc->hbrbackground,
+        .menu_name = wc->menu_name, .class_name = wc->class_name,
+    };
+    return w_RegisterClassA(&plain);
+}
+
+static hwnd_state_t *alloc_hwnd_state(void)
+{
+    for (u32 i = 0; i < MAX_HWNDS; i++)
+        if (!hwnd_states[i].used)
+            return &hwnd_states[i];
+    return NULL;
+}
+
+static void *WINAPI w_CreateWindowExA(u32 ex_style, const char *class_name,
+                                      const char *title, u32 style,
+                                      s32 x, s32 y, s32 w, s32 h,
+                                      void *parent, void *menu,
+                                      void *hinstance, void *param)
+{
+    (void)ex_style;
+    (void)style;
+    (void)x;
+    (void)y; /* wm_create always picks position via its own cascade */
+    (void)parent;
+    (void)menu;
+    (void)hinstance;
+    (void)param;
+
+    win_class_t *cls = find_class(class_name);
+    if (!cls)
+        return NULL;
+    if (w <= 0) /* catches CW_USEDEFAULT (0x80000000, negative as s32) */
+        w = 400;
+    if (h <= 0)
+        h = 300;
+
+    window_t *win = wm_create(title ? title : "", w, h, current_process,
+                              true);
+    if (!win)
+        return NULL;
+    hwnd_state_t *hs = alloc_hwnd_state();
+    if (!hs) {
+        wm_destroy(win);
+        return NULL;
+    }
+    hs->used = true;
+    hs->win = win;
+    hs->wndproc = cls->wndproc;
+    hs->needs_paint = true;
+    hs->text_color = RGB(0, 0, 0);
+
+    surface_t s = { win->canvas, win->w, win->h };
+    gfx_fill(&s, 0, 0, win->w, win->h, RGB(0xf0, 0xf0, 0xf0));
+    return win; /* HWND == the underlying window_t* */
+}
+
+static int WINAPI w_DestroyWindow(void *hwnd)
+{
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (!hs)
+        return 0;
+    /* Real DestroyWindow sends WM_DESTROY synchronously to the window's
+       own WndProc *before* actually tearing anything down — that's how
+       a real app gets the chance to call PostQuitMessage(0) in response
+       and end its own message loop. Skipping this (as an earlier
+       version of this function did) silently destroys the underlying
+       window while the app's GetMessageA loop keeps polling a
+       still-"used" hwnd_state that just never produces another event
+       again: not a crash, but a permanent hang. */
+    if (hs->wndproc)
+        hs->wndproc(hwnd, WM_DESTROY, 0, 0);
+    wm_destroy(hs->win);
+    hs->used = false;
+    hs->win = NULL;
+    return 1;
+}
+
+static int WINAPI w_ShowWindow(void *hwnd, int cmd)
+{
+    (void)cmd;
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (hs)
+        wm_present(hs->win);
+    return hs != NULL;
+}
+
+static int WINAPI w_UpdateWindow(void *hwnd)
+{
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (hs)
+        hs->needs_paint = true; /* delivered as WM_PAINT by GetMessageA */
+    return hs != NULL;
+}
+
+static s64 WINAPI w_DefWindowProcA(void *hwnd, u32 msg, u64 wparam,
+                                   s64 lparam)
+{
+    (void)wparam;
+    (void)lparam;
+    if (msg == WM_CLOSE)
+        w_DestroyWindow(hwnd); /* matches real DefWindowProcA exactly */
+    return 0;
+}
+
+typedef struct {
+    void *hwnd;
+    u32 message;
+    u64 wparam;
+    s64 lparam;
+    u32 time;
+    s32 pt_x, pt_y;
+} msg_a_t;
+
+static int WINAPI w_GetMessageA(msg_a_t *msg, void *hwnd_filter, u32 min,
+                                u32 max)
+{
+    (void)hwnd_filter;
+    (void)min;
+    (void)max;
+    if (!msg)
+        return 0;
+
+    for (;;) {
+        if (quit_posted) {
+            msg->hwnd = NULL;
+            msg->message = WM_QUIT;
+            msg->wparam = (u64)(s64)quit_code;
+            msg->lparam = 0;
+            return 0;
+        }
+
+        for (u32 i = 0; i < MAX_HWNDS; i++) {
+            hwnd_state_t *hs = &hwnd_states[i];
+            if (!hs->used || !hs->win)
+                continue;
+            alpha_event_t ev;
+            if (!wm_poll_event(hs->win, &ev))
+                continue;
+            msg->hwnd = hs->win;
+            msg->wparam = 0;
+            msg->lparam = 0;
+            switch (ev.type) {
+            case ALPHA_EV_CLOSE:
+                msg->message = WM_CLOSE;
+                break;
+            case ALPHA_EV_MOUSE_DOWN:
+                msg->message = WM_LBUTTONDOWN;
+                msg->wparam = (u64)ev.buttons;
+                msg->lparam = (s64)((ev.y << 16) | (ev.x & 0xFFFF));
+                break;
+            case ALPHA_EV_MOUSE_UP:
+                msg->message = WM_LBUTTONUP;
+                msg->lparam = (s64)((ev.y << 16) | (ev.x & 0xFFFF));
+                break;
+            case ALPHA_EV_MOUSE_MOVE:
+                msg->message = WM_MOUSEMOVE;
+                msg->wparam = (u64)ev.buttons;
+                msg->lparam = (s64)((ev.y << 16) | (ev.x & 0xFFFF));
+                break;
+            case ALPHA_EV_KEY:
+                msg->message = WM_CHAR;
+                msg->wparam = (u64)ev.key;
+                break;
+            default:
+                continue; /* unrecognized: skip, keep polling */
+            }
+            return 1;
+        }
+
+        for (u32 i = 0; i < MAX_HWNDS; i++) {
+            hwnd_state_t *hs = &hwnd_states[i];
+            if (hs->used && hs->win && hs->needs_paint) {
+                hs->needs_paint = false;
+                msg->hwnd = hs->win;
+                msg->message = WM_PAINT;
+                msg->wparam = 0;
+                msg->lparam = 0;
+                return 1;
+            }
+        }
+
+        sleep_ms(10); /* idle politely: the CPU sleeps in hlt */
+    }
+}
+
+static int WINAPI w_TranslateMessage(const msg_a_t *msg)
+{
+    (void)msg; /* no WM_KEYDOWN -> WM_CHAR synthesis to do: we already
+                  deliver WM_CHAR directly from ALPHA_EV_KEY */
+    return 1;
+}
+
+static s64 WINAPI w_DispatchMessageA(const msg_a_t *msg)
+{
+    if (!msg || msg->message == WM_QUIT)
+        return 0;
+    hwnd_state_t *hs = find_hwnd(msg->hwnd);
+    if (hs && hs->wndproc)
+        return hs->wndproc(msg->hwnd, msg->message, msg->wparam,
+                           msg->lparam);
+    return w_DefWindowProcA(msg->hwnd, msg->message, msg->wparam,
+                            msg->lparam);
+}
+
+static void WINAPI w_PostQuitMessage(int code)
+{
+    quit_posted = true;
+    quit_code = code;
+}
+
+typedef struct { s32 left, top, right, bottom; } rect_t;
+
+typedef struct {
+    void *hdc;
+    s32 erase;
+    rect_t paint_rect;
+    s32 restore;
+    s32 inc_update;
+    u8 reserved[32];
+} paintstruct_t;
+
+static void *WINAPI w_BeginPaint(void *hwnd, paintstruct_t *ps)
+{
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (!hs || !hs->win)
+        return NULL;
+    if (ps) {
+        memset(ps, 0, sizeof(*ps));
+        ps->hdc = hwnd;
+        ps->erase = 1;
+        ps->paint_rect.right = hs->win->w;
+        ps->paint_rect.bottom = hs->win->h;
+    }
+    return hwnd; /* HDC == HWND, see the section comment above */
+}
+
+static int WINAPI w_EndPaint(void *hwnd, const paintstruct_t *ps)
+{
+    (void)ps;
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (!hs || !hs->win)
+        return 0;
+    wm_present(hs->win);
+    return 1;
+}
+
+static int WINAPI w_GetClientRect(void *hwnd, rect_t *rc)
+{
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (!hs || !hs->win || !rc)
+        return 0;
+    rc->left = 0;
+    rc->top = 0;
+    rc->right = hs->win->w;
+    rc->bottom = hs->win->h;
+    return 1;
+}
+
+static int WINAPI w_InvalidateRect(void *hwnd, const rect_t *rc, int erase)
+{
+    (void)rc;
+    (void)erase;
+    hwnd_state_t *hs = find_hwnd(hwnd);
+    if (!hs)
+        return 0;
+    hs->needs_paint = true;
+    return 1;
+}
+
+static void *WINAPI w_LoadCursorA(void *hinstance, const char *name)
+{
+    (void)hinstance;
+    (void)name;
+    return (void *)0x1; /* any nonzero handle: we don't render a real cursor */
+}
+
+static void *WINAPI w_LoadIconA(void *hinstance, const char *name)
+{
+    (void)hinstance;
+    (void)name;
+    return (void *)0x1;
+}
+
+/* ---- GDI32 -------------------------------------------------------------
+ * HDC == HWND in this simplified model (see the section comment above),
+ * so every GDI call below resolves straight back to a hwnd_state_t. */
+
+static int WINAPI w_TextOutA(void *hdc, s32 x, s32 y, const char *text,
+                             s32 len)
+{
+    hwnd_state_t *hs = find_hwnd(hdc);
+    if (!hs || !hs->win || !text)
+        return 0;
+    char buf[256];
+    s32 n = len;
+    if (n < 0)
+        n = 0;
+    if (n > (s32)sizeof(buf) - 1)
+        n = sizeof(buf) - 1;
+    memcpy(buf, text, n);
+    buf[n] = 0;
+    surface_t s = { hs->win->canvas, hs->win->w, hs->win->h };
+    gfx_text(&s, x, y, buf, hs->text_color);
+    return 1;
+}
+
+static u32 WINAPI w_SetTextColor(void *hdc, u32 colorref)
+{
+    hwnd_state_t *hs = find_hwnd(hdc);
+    if (!hs)
+        return 0xFFFFFFFF; /* CLR_INVALID */
+    u32 old = hs->text_color;
+    /* COLORREF is 0x00bbggrr, opposite byte order from our ARGB RGB() */
+    hs->text_color = RGB(colorref & 0xFF, (colorref >> 8) & 0xFF,
+                         (colorref >> 16) & 0xFF);
+    return old;
+}
+
+static u32 WINAPI w_SetBkColor(void *hdc, u32 colorref)
+{
+    (void)hdc;
+    (void)colorref; /* background fill mode not modeled: text draws with
+                        a transparent background already (gfx_text only
+                        touches glyph pixels) */
+    return 0;
+}
+
+static int WINAPI w_SetBkMode(void *hdc, int mode)
+{
+    (void)hdc;
+    (void)mode;
+    return 1; /* OPAQUE, previous value: unused either way */
+}
+
+static int WINAPI w_FillRect(void *hdc, const rect_t *rc, void *brush)
+{
+    hwnd_state_t *hs = find_hwnd(hdc);
+    if (!hs || !hs->win || !rc)
+        return 0;
+    /* stock brush handles are small integers from GetStockObject below;
+       anything else defaults to white, a reasonable background guess */
+    u32 color = ((uptr)brush == 1) ? RGB(0, 0, 0) : RGB(0xff, 0xff, 0xff);
+    surface_t s = { hs->win->canvas, hs->win->w, hs->win->h };
+    int w = rc->right - rc->left, h = rc->bottom - rc->top;
+    if (w > 0 && h > 0)
+        gfx_fill(&s, rc->left, rc->top, w, h, color);
+    return 1;
+}
+
+static void *WINAPI w_GetStockObject(int obj)
+{
+    return (void *)(uptr)(obj + 1); /* nonzero, distinguishable handles */
+}
 
 #define MB_MAX_LINES 8
 
@@ -395,6 +916,11 @@ static char *empty_environ[] = { NULL };
 static int   argc_storage = 1;
 static char **argv_storage = empty_argv;
 static char **envp_storage = empty_environ;
+/* _acmdln: msvcrt data export, pointer to the raw command-line string
+   (same one-level-of-indirection pattern as __initenv/_fmode/_commode
+   below) — value refreshed in win32_reset_process_state() since the
+   command line changes per process. */
+static char *acmdln_storage;
 
 #define IOB_SIZE  32
 #define IOB_COUNT 3   /* stdin, stdout, stderr — all we ever hand out */
@@ -464,6 +990,10 @@ void win32_reset_process_state(void)
     fmode_storage = 0;
     commode_storage = 0;
     win32_setup_teb();
+    win32_reset_gui_state(); /* stale window classes/HWNDs from a prior
+                                 win-style process must not leak into
+                                 this one — see the GUI section comment */
+    acmdln_storage = current_process ? current_process->cmdline : NULL;
 }
 
 static int WINAPI w___getmainargs(int *argc, char ***argv, char ***envp,
@@ -477,6 +1007,12 @@ static int WINAPI w___getmainargs(int *argc, char ***argv, char ***envp,
         *argv = argv_storage;
     if (envp)
         *envp = envp_storage;
+    return 0;
+}
+
+static int WINAPI w_ismbblead(u32 c)
+{
+    (void)c; /* single-byte codepage: no lead bytes, ever */
     return 0;
 }
 
@@ -748,13 +1284,40 @@ static const win_export_t kernel32_exports[] = {
     { "VirtualQuery",     w_VirtualQuery },
     { "SetUnhandledExceptionFilter", w_SetUnhandledExceptionFilter },
     { "GetModuleHandleA", w_GetModuleHandleA },
+    { "GetStartupInfoA",  w_GetStartupInfoA },
     /* LoadLibraryA / GetProcAddress defined below (need the tables) */
     { "LoadLibraryA",    NULL },
     { "GetProcAddress",  NULL },
 };
 
 static const win_export_t user32_exports[] = {
-    { "MessageBoxA", w_MessageBoxA },
+    { "MessageBoxA",       w_MessageBoxA },
+    { "RegisterClassA",    w_RegisterClassA },
+    { "RegisterClassExA",  w_RegisterClassExA },
+    { "CreateWindowExA",   w_CreateWindowExA },
+    { "DestroyWindow",     w_DestroyWindow },
+    { "ShowWindow",        w_ShowWindow },
+    { "UpdateWindow",      w_UpdateWindow },
+    { "DefWindowProcA",    w_DefWindowProcA },
+    { "GetMessageA",       w_GetMessageA },
+    { "TranslateMessage",  w_TranslateMessage },
+    { "DispatchMessageA",  w_DispatchMessageA },
+    { "PostQuitMessage",   w_PostQuitMessage },
+    { "BeginPaint",        w_BeginPaint },
+    { "EndPaint",          w_EndPaint },
+    { "GetClientRect",     w_GetClientRect },
+    { "InvalidateRect",    w_InvalidateRect },
+    { "LoadCursorA",       w_LoadCursorA },
+    { "LoadIconA",         w_LoadIconA },
+};
+
+static const win_export_t gdi32_exports[] = {
+    { "TextOutA",       w_TextOutA },
+    { "SetTextColor",   w_SetTextColor },
+    { "SetBkColor",     w_SetBkColor },
+    { "SetBkMode",      w_SetBkMode },
+    { "FillRect",       w_FillRect },
+    { "GetStockObject", w_GetStockObject },
 };
 
 static const win_export_t msvcrt_exports[] = {
@@ -764,11 +1327,13 @@ static const win_export_t msvcrt_exports[] = {
     { "__set_app_type",        w_set_app_type },
     { "__setusermatherr",      w_setusermatherr },
     { "__C_specific_handler",  w___C_specific_handler },
+    { "_acmdln",                NULL }, /* data export, patched in below */
     { "_amsg_exit",            w_amsg_exit },
     { "_cexit",                w_cexit },
     { "_commode",               NULL }, /* data export, patched in below */
     { "_fmode",                 NULL }, /* data export, patched in below */
     { "_initterm",             w_initterm },
+    { "_ismbblead",            w_ismbblead },
     { "_onexit",               w_onexit },
     { "abort",                 w_abort },
     { "calloc",                w_calloc },
@@ -791,6 +1356,8 @@ static win_module_t modules[] = {
       sizeof(user32_exports) / sizeof(win_export_t) },
     { "msvcrt.dll", msvcrt_exports,
       sizeof(msvcrt_exports) / sizeof(win_export_t) },
+    { "gdi32.dll", gdi32_exports,
+      sizeof(gdi32_exports) / sizeof(win_export_t) },
 };
 
 static int name_eq_nocase(const char *a, const char *b)
@@ -852,7 +1419,7 @@ void win32_init(void)
             e->fn = (void *)w_GetProcAddress;
     }
 
-    /* msvcrt's __initenv/_fmode/_commode are DATA the CRT reads
+    /* msvcrt's __initenv/_acmdln/_fmode/_commode are DATA the CRT reads
        directly (through one level of dllimport indirection), not
        functions to call — the IAT slot must hold the address of a
        real variable we own, not a trampoline. */
@@ -860,13 +1427,16 @@ void win32_init(void)
         win_export_t *e = (win_export_t *)&modules[2].exports[i];
         if (strcmp(e->name, "__initenv") == 0)
             e->fn = (void *)&envp_storage;
+        else if (strcmp(e->name, "_acmdln") == 0)
+            e->fn = (void *)&acmdln_storage;
         else if (strcmp(e->name, "_fmode") == 0)
             e->fn = (void *)&fmode_storage;
         else if (strcmp(e->name, "_commode") == 0)
             e->fn = (void *)&commode_storage;
     }
 
-    kprintf("win32: %u exports in kernel32.dll, %u in user32.dll, "
-            "%u in msvcrt.dll (x64 ABI)\n",
-            modules[0].count, modules[1].count, modules[2].count);
+    kprintf("win32: %u kernel32, %u user32, %u msvcrt, %u gdi32 exports "
+            "(x64 ABI)\n",
+            modules[0].count, modules[1].count, modules[2].count,
+            modules[3].count);
 }

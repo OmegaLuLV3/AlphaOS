@@ -8,7 +8,7 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.5 -- a lightweight OS that runs .exe files
+  AlphaOS 0.6 -- a lightweight OS that runs .exe files
   130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
@@ -21,7 +21,9 @@ hello from a REAL mingw-w64 compiled Windows binary
 That's not one of AlphaOS's own apps — it's `compat/mingw_hello.c`,
 compiled by an **unmodified `x86_64-w64-mingw32-gcc`**, default flags,
 full CRT startup (TLS, critical sections, argc/argv, atexit), no special
-entry point. It just runs.
+entry point. It just runs. Neither is `compat/mingw_winapp.c` below — a
+genuine mingw-w64 `-mwindows` **GUI** binary, registering a window class
+and running a real `GetMessageA`/`DispatchMessageA` loop.
 
 ![start menu](docs/screenshot-startmenu.png)
 *The desktop: terminal window running the shell, start menu, taskbar
@@ -34,6 +36,13 @@ the AlphaOS windowing API.*
 ![msgbox.exe](docs/screenshot-msgbox.png)
 *`msgbox.exe` — a Windows-style program calling
 `user32.dll!MessageBoxA` through its PE import table.*
+
+![mingw_winapp.exe](docs/screenshot-winapp.png)
+*`mingw_winapp.exe` — a real, unmodified mingw-w64 `-mwindows` GUI
+binary: `RegisterClassA` → `CreateWindowExA` → a genuine
+`GetMessageA`/`DispatchMessageA` message loop, painting through
+`BeginPaint`/`TextOutA`/`EndPaint`, closing cleanly through
+`WM_CLOSE` → `DestroyWindow` → `WM_DESTROY` → `PostQuitMessage`.*
 
 ## Highlights
 
@@ -76,6 +85,21 @@ the AlphaOS windowing API.*
   dialog with an OK button. Unresolved imports fail the load with the
   missing `dll!symbol` named. Legacy AlphaOS-API programs (no imports)
   still run; the loader picks the convention per binary.
+- **Real Win32 GUI apps, not just AlphaOS's own** — a `user32.dll`/
+  `gdi32.dll` window/message subsystem (`RegisterClassA`,
+  `CreateWindowExA`, `ShowWindow`/`UpdateWindow`, a real
+  `GetMessageA`/`TranslateMessage`/`DispatchMessageA` loop dispatching
+  to the app's own `WndProc` through a real function pointer under the
+  `ms_abi` convention, `DefWindowProcA`, `BeginPaint`/`EndPaint`,
+  `TextOutA`/`SetTextColor`/`FillRect`, `PostQuitMessage`) layered on
+  top of the existing window manager/compositor. `WM_CLOSE` goes
+  through `DestroyWindow`, which dispatches a real `WM_DESTROY` to the
+  app first — so a normal app's own `PostQuitMessage(0)` in its
+  `WM_DESTROY` handler is what ends its message loop, exactly like
+  real Windows. Proven against `compat/mingw_winapp.c`: an ordinary
+  mingw-w64 `-mwindows` build that registers a class, opens a window,
+  paints text, and exits with code 0 when its close button is clicked
+  — no source changes, no special entry point.
 - **Enough of a CRT to run real third-party binaries, not just our
   own** — a `msvcrt.dll` module (`__getmainargs`, `__iob_func`,
   `_initterm`, `_onexit`/`_cexit`, `malloc`/`calloc`/`free`,
@@ -151,14 +175,15 @@ Requirements: `gcc` (with x86-64 support — the default on most Linux
 distros), `binutils`, `make`, `python3`, `qemu-system-x86_64`,
 `grub-mkrescue` + `xorriso` (to build the bootable ISO — see below for
 why). Optional: `x86_64-w64-mingw32-gcc` (mingw-w64) to build and
-regression-test the real third-party compat binary — skipped cleanly
-if absent. No cross-compiler needed for AlphaOS itself.
+regression-test the real third-party compat binaries (a console app
+and a GUI app) — skipped cleanly if absent. No cross-compiler needed
+for AlphaOS itself.
 
 ```sh
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (37 assertions)
+make test     # scripted end-to-end boot test (38 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -201,6 +226,7 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
 | `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |
 | `compat/mingw_hello.c` → `mingw_hello.exe` | **real third-party binary**: unmodified default `x86_64-w64-mingw32-gcc` output, full CRT — built only if mingw-w64 is installed |
+| `compat/mingw_winapp.c` → `mingw_winapp.exe` | **real third-party GUI binary**: unmodified `-mwindows` mingw-w64 output — `RegisterClassA`/`CreateWindowExA`/message loop/`TextOutA` — built only if mingw-w64 is installed |
 
 ## How a `.exe` is born and executed
 
@@ -244,12 +270,17 @@ lightweight design (no TSS/ring-3 machinery); protection comes from
 paging, validation, and exception recovery rather than privilege levels.
 
 Scope note: AlphaOS implements the Win32 *mechanism* (PE32+ imports,
-the real Microsoft x64 ABI, IAT patching) and a useful API subset. A
-program written against this subset — even built with a real Windows
-toolchain (MinGW `-nostdlib`, no CRT) — runs unmodified, calling
-convention and all. Arbitrary off-the-shelf Windows software still
-won't: that needs the full Win32 surface and a CRT (a Wine-sized
-project). Unsupported imports are reported by name at load time — see
+the real Microsoft x64 ABI, IAT patching) and a useful, growing API
+subset — kernel32 CRT startup support, a `msvcrt.dll` runtime, and a
+`user32.dll`/`gdi32.dll` window/message subsystem. A program written
+against this subset — including an unmodified, default-flags
+mingw-w64 build with full CRT startup, and including GUI apps that
+open real windows and paint through GDI — runs as-is, calling
+convention and all (`compat/mingw_hello.c`, `compat/mingw_winapp.c`).
+Arbitrary off-the-shelf Windows software still generally won't: the
+full Win32 surface (files, registry, threads, networking, COM, richer
+GDI/USER32, ...) is a Wine-sized project, and this subset is far from
+that. Unsupported imports are reported by name at load time — see
 `peinfo` on a real Windows binary for a demonstration of exactly how
 far the loader gets before it needs something AlphaOS doesn't provide.
 
@@ -264,9 +295,10 @@ kernel/   boot.S (long-mode transition), GDT/IDT (64-bit), drivers
           terminal, shell
 apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
           Windows-style runtime (win32.h, wincrt0.S, imports.list)
-compat/   mingw_hello.c — built by a real mingw-w64 cross compiler,
-          not AlphaOS's own toolchain, to regression-test genuine
-          third-party Win32 binary compatibility
+compat/   mingw_hello.c, mingw_winapp.c — built by a real mingw-w64
+          cross compiler, not AlphaOS's own toolchain, to
+          regression-test genuine third-party Win32 console + GUI
+          binary compatibility
 boot/     grub.cfg for the bootable ISO
 tools/    mkpe.py (flat binary → PE32+ w/ import tables), mkimports.py,
           mkinitrd.py, run_tests.sh, ai_bridge.py (host half of `ai`)

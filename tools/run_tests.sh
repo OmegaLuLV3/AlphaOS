@@ -27,6 +27,13 @@ feed() {
     if [ "$HAVE_MINGW" = 1 ]; then
         printf 'run mingw_hello.exe\n'
         sleep 1.5
+        # mingw_winapp.exe is a real GUI app with a GetMessageA message
+        # loop that only ends on a mouse click on its close button —
+        # this non-interactive harness can't provide that, so just
+        # confirm the loader parses its PE headers/imports correctly
+        # (peinfo) rather than actually running it into a hang.
+        printf 'peinfo mingw_winapp.exe\n'
+        sleep 1.5
     fi
     printf 'halt\n'
 }
@@ -51,7 +58,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.5"
+check "AlphaOS 0.6"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -70,7 +77,7 @@ check "primes below 10000: 1229"                   # correct computation
 check "leaking the rest on purpose"                # memhog ran
 check "reclaimed"                                  # kernel reclaimed leaks
 # Windows-style API (PE import table)
-check "win32: .* exports in kernel32.dll"
+check "win32: .* kernel32, .* user32, .* msvcrt, .* gdi32 exports"
 check "imports        kernel32.dll: ExitProcess"   # peinfo import dump
 check "Hello from winhello.exe"
 check "resolved from the PE import table"
@@ -86,9 +93,10 @@ check "not found"                                  # run nope.exe error path
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command
 if [ "$HAVE_MINGW" = 1 ]; then
-    check "msvcrt.dll"                                 # win32_init log line
     check "hello from a REAL mingw-w64 compiled Windows binary"
     check "mingw_hello.exe exited with code 0"         # genuine 3rd-party .exe ran
+    check "imports        USER32.dll: BeginPaint"      # real GUI app's import table parses
+    check "imports        GDI32.dll: TextOutA"
 else
     echo "SKIP: mingw-w64 compat checks (no cross compiler at build time)"
 fi

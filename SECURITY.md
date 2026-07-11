@@ -169,9 +169,58 @@ added later.
 **Fix:** bounds-checked the same way as everything else in this file,
 now, before it's ever load-bearing.
 
+### 10. `WM_CLOSE` destroyed the window without dispatching `WM_DESTROY`
+— **correctness, not exploitable, but a real hang**
+
+**Where:** `kernel/win32.c`, the new `USER32.dll` window/message
+subsystem added to run real GUI binaries (see the top-level README for
+what this subsystem is).
+
+The default `WM_CLOSE` handling tore down the underlying window
+directly instead of calling through `DestroyWindow`, which real
+Windows uses specifically because it synchronously dispatches
+`WM_DESTROY` to the window's own `WndProc` *before* anything is torn
+down — that's the app's only chance to call `PostQuitMessage` and end
+its own message loop. Skipping that step meant closing a real Win32
+GUI app's window via its X button permanently hung the process: its
+`GetMessageA` loop kept polling a window that would never produce
+another event or a paint request again, and `quit_posted` was never
+set. Not a memory-safety bug (nothing was corrupted, no OOB access),
+but a real correctness bug that would have made every real GUI app
+un-closeable.
+
+**Fix:** `WM_CLOSE`'s default handler now calls the same
+`DestroyWindow` path a real app would, which dispatches `WM_DESTROY`
+to the registered `WndProc` first. Verified interactively: a real
+mingw-w64-compiled GUI binary (`compat/mingw_winapp.c`) now exits with
+code 0 after its window is closed via a scripted click on its close
+button, with the usual per-process resource reclamation still firing.
+
+### 11. SSE was never enabled at the CPU level — **compatibility gap,
+not a vulnerability, documented for completeness**
+
+**Where:** `kernel/kernel.c`.
+
+Not a security finding, but adjacent to this pass in spirit: every
+kernel C file is compiled with `-mgeneral-regs-only` (see finding
+history in earlier commits) so *our own* code never emits SSE
+instructions — but that flag only controls our compiler's codegen, not
+the CPU. `CR4.OSFXSR` defaulted to 0, so any SSE instruction anywhere,
+including in an externally-compiled `.exe`, was simply unrecognized by
+the CPU (`#UD`, invalid opcode) the instant it executed — and SSE2 is
+mandatory baseline on real x86-64, so normal compiler codegen (e.g. a
+struct zero-init becoming `pxor %xmm0,%xmm0`) hits this immediately in
+practically any real-world binary. Fixed by actually enabling SSE
+(`CR0.EM=0`, `CR0.MP=1`, `CR4.OSFXSR=1`, `CR4.OSXMMEXCPT=1`) once during
+boot. No FPU/SSE context save-restore was added alongside this, and
+that omission is intentional, not an oversight: AlphaOS never runs two
+processes concurrently and the kernel's own code never touches
+XMM/x87 state, so there is no second execution context whose SSE
+state could ever collide with an app's.
+
 ## Verification
 
-Beyond `make test` (37 assertions, including the malicious-file checks
+Beyond `make test` (38 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 
@@ -203,6 +252,18 @@ containment, not just rejection.
   `HeapAlloc`/`malloc`/`calloc` call is tracked per-process and reclaimed
   on exit or crash — a crashing or malicious process cannot leak kernel
   heap memory across runs.
+- **The USER32/GDI32 window subsystem (`kernel/win32.c`) reuses the
+  fault-isolation boundary rather than adding a new one.** Window
+  classes and HWNDs live in small fixed-size tables
+  (`MAX_WIN_CLASSES`/`MAX_HWNDS` = 16), reset at the start of every
+  win-style process (`win32_reset_gui_state()`, called from
+  `win32_reset_process_state()`) so a previous process's registrations
+  or dangling window pointers can never leak into the next one.
+  Calling into an app's registered `WndProc` (from `DispatchMessageA`
+  or `DestroyWindow`'s `WM_DESTROY` dispatch) is exactly the same kind
+  of "call an attacker-supplied function pointer" as calling the PE
+  entry point itself — already covered by the same `k_setjmp`/
+  `proc.running=true` region finding #1 hardened, not a new exposure.
 - **`-mno-red-zone -mgeneral-regs-only`** on every C compilation unit —
   not a security feature per se, but their *absence* would be a
   correctness bug that manifests as stack corruption under interrupts;

@@ -56,7 +56,7 @@ IMPORTS  := apps/win32/imports.list
 # produce. Silently skipped otherwise — never required for `make`.
 MINGW_CC := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
 ifneq ($(MINGW_CC),)
-COMPAT_EXES := $(BUILD)/apps/mingw_hello.exe
+COMPAT_EXES := $(BUILD)/apps/mingw_hello.exe $(BUILD)/apps/mingw_winapp.exe
 endif
 
 .PHONY: all run run-vga test clean
@@ -120,6 +120,9 @@ $(WIN_EXES): $(BUILD)/apps/%.exe: $(BUILD)/apps/%.winelf tools/mkpe.py \
 
 $(BUILD)/apps/mingw_hello.exe: compat/mingw_hello.c | $(BUILD)/apps
 	$(MINGW_CC) -O2 -o $@ $<
+
+$(BUILD)/apps/mingw_winapp.exe: compat/mingw_winapp.c | $(BUILD)/apps
+	$(MINGW_CC) -O2 -mwindows -o $@ $<
 
 $(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES) tools/mkinitrd.py
 	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES)
