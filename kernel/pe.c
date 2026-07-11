@@ -108,6 +108,14 @@ typedef struct {
     const section_header_t *sections;
 } pe_view_t;
 
+/*
+ * Every size/offset field below comes straight from the file and must
+ * be treated as hostile: nothing here may add two attacker-controlled
+ * u32 values and compare the (possibly wrapped) 32-bit result. Every
+ * addition that feeds a bounds check is done in uptr (64-bit) so nothing
+ * near UINT32_MAX can wrap small and slip past a check that looks
+ * correct at a glance.
+ */
 static const char *pe_parse(const rd_file_t *f, pe_view_t *out)
 {
     if (f->size < sizeof(dos_header_t))
@@ -115,7 +123,7 @@ static const char *pe_parse(const rd_file_t *f, pe_view_t *out)
     const dos_header_t *dos = (const dos_header_t *)f->data;
     if (dos->e_magic != 0x5A4D)
         return "missing MZ signature (not a .exe)";
-    if (dos->e_lfanew + 4 + sizeof(coff_header_t) > f->size)
+    if ((uptr)dos->e_lfanew + 4 + sizeof(coff_header_t) > f->size)
         return "PE header out of bounds";
     if (memcmp(f->data + dos->e_lfanew, "PE\0\0", 4) != 0)
         return "missing PE signature";
@@ -128,7 +136,7 @@ static const char *pe_parse(const rd_file_t *f, pe_view_t *out)
         return "optional header too small";
 
     const opt_header_t *opt = (const opt_header_t *)(coff + 1);
-    if ((const u8 *)opt + coff->opt_hdr_size > f->data + f->size)
+    if ((uptr)((const u8 *)opt - f->data) + coff->opt_hdr_size > f->size)
         return "optional header out of bounds";
     if (opt->magic != PE_MAGIC_PE32PLUS)
         return "not a PE32+ image (32-bit PE32 unsupported)";
@@ -141,15 +149,19 @@ static const char *pe_parse(const rd_file_t *f, pe_view_t *out)
         return "image base collides with kernel address space";
     if (opt->image_base & 0xFFF)
         return "image base not page aligned";
+    if (opt->size_of_headers > opt->size_of_image)
+        return "size_of_headers exceeds size_of_image";
 
     const section_header_t *sec =
         (const section_header_t *)((const u8 *)opt + coff->opt_hdr_size);
-    if ((const u8 *)(sec + coff->num_sections) > f->data + f->size)
+    if ((uptr)((const u8 *)sec - f->data) +
+            (uptr)coff->num_sections * sizeof(section_header_t) > f->size)
         return "section table out of bounds";
     for (u32 i = 0; i < coff->num_sections; i++) {
-        if (sec[i].raw_ptr + sec[i].raw_size > f->size)
+        if ((uptr)sec[i].raw_ptr + sec[i].raw_size > f->size)
             return "section raw data out of bounds";
-        if (sec[i].virtual_addr + sec[i].virtual_size > opt->size_of_image)
+        if ((uptr)sec[i].virtual_addr + sec[i].virtual_size >
+            opt->size_of_image)
             return "section exceeds image size";
     }
     if (opt->entry_point >= opt->size_of_image)
@@ -263,30 +275,52 @@ static const char *resolve_imports(uptr base, const pe_view_t *pe,
         return NULL; /* no imports: legacy AlphaOS-API program */
 
     u32 img_size = pe->opt->size_of_image;
-    if (dir_rva + sizeof(import_desc_t) > img_size)
-        return "import directory out of bounds";
+    u32 desc_off = dir_rva;
 
-    for (import_desc_t *d = (import_desc_t *)(base + dir_rva);
-         d->name_rva; d++) {
-        if ((uptr)(d + 1) - base > img_size)
+    for (;;) {
+        /* Bounds-check BEFORE touching this descriptor at all — not in
+           a for-loop condition that would read the *next* one first.
+           Every addition here is uptr-widened: img_size is capped at
+           MAX_IMAGE_SIZE (16 MiB) by pe_parse(), but desc_off/lookup
+           offsets are raw attacker-controlled u32s, and adding two of
+           those in 32-bit arithmetic is exactly how a bounds check
+           gets bypassed by wraparound. */
+        if ((uptr)desc_off + sizeof(import_desc_t) > img_size)
             return "import descriptor out of bounds";
-        if (d->name_rva >= img_size || d->iat_rva + 8 > img_size)
+        import_desc_t *d = (import_desc_t *)(base + desc_off);
+        if (!d->name_rva)
+            break; /* terminator descriptor: normal end of table */
+
+        if ((uptr)d->name_rva >= img_size)
             return "import descriptor fields out of bounds";
+        u32 lookup_rva = d->ilt_rva ? d->ilt_rva : d->iat_rva;
+        if ((uptr)lookup_rva + 8 > img_size)
+            return "import lookup table out of bounds";
+        if ((uptr)d->iat_rva + 8 > img_size)
+            return "import address table out of bounds";
 
         const char *dll = (const char *)(base + d->name_rva);
-        u32 lookup_rva = d->ilt_rva ? d->ilt_rva : d->iat_rva;
         u64 *lookup = (u64 *)(base + lookup_rva);
         u64 *iat = (u64 *)(base + d->iat_rva);
 
-        for (u32 i = 0; lookup[i]; i++) {
-            if ((base + lookup_rva + (i + 1) * 8) - base > img_size)
+        for (u32 i = 0; ; i++) {
+            /* Bound both the read side (lookup[i]) and the write side
+               (iat[i]) before touching either — they can be different
+               regions of the image with different valid extents. */
+            if ((uptr)lookup_rva + (u64)(i + 1) * 8 > img_size)
                 return "import thunk table out of bounds";
-            if (lookup[i] & IMAGE_ORDINAL_FLAG64)
+            if ((uptr)d->iat_rva + (u64)(i + 1) * 8 > img_size)
+                return "import address table write out of bounds";
+
+            u64 thunk = lookup[i];
+            if (!thunk)
+                break;
+            if (thunk & IMAGE_ORDINAL_FLAG64)
                 return "ordinal imports not supported (import by name)";
-            if ((u32)lookup[i] + 2 >= img_size)
+            if ((uptr)(u32)thunk + 2 >= img_size)
                 return "import hint/name out of bounds";
 
-            const char *func = (const char *)(base + (u32)lookup[i] + 2);
+            const char *func = (const char *)(base + (u32)thunk + 2);
             void *impl = win_resolve(dll, func);
             if (!impl) {
                 kprintf("exec: unresolved import %s!%s\n", dll, func);
@@ -295,6 +329,7 @@ static const char *resolve_imports(uptr base, const pe_view_t *pe,
             iat[i] = (u64)(uptr)impl;
         }
         *win_style = true;
+        desc_off += sizeof(import_desc_t);
     }
     return NULL;
 }
@@ -304,30 +339,41 @@ static void apply_relocs(const rd_file_t *f, const pe_view_t *pe,
 {
     s64 delta = (s64)(loaded_base - pe->opt->image_base);
     if (delta == 0 || pe->opt->num_data_dirs <= DIR_BASERELOC)
-        return;
+        return; /* we always load at the preferred base today, so delta
+                    is always 0 and this function never reaches the body
+                    below — but it's written as if it will, so it's
+                    bounds-checked as if it will */
     u32 rva = pe->opt->data_dir[DIR_BASERELOC].rva;
     u32 size = pe->opt->data_dir[DIR_BASERELOC].size;
     if (!rva || !size)
         return;
 
-    u8 *block = (u8 *)(loaded_base + rva);
-    u8 *end = block + size;
-    while (block + 8 <= end) {
+    u32 img_size = pe->opt->size_of_image;
+    if ((uptr)rva + size > img_size)
+        return; /* malformed directory: silently skip rather than trust it */
+
+    u32 off_in_dir = 0;
+    while (off_in_dir + 8 <= size) {
+        u8 *block = (u8 *)(loaded_base + rva + off_in_dir);
         u32 page_rva = *(u32 *)block;
         u32 block_size = *(u32 *)(block + 4);
-        if (block_size < 8)
+        if (block_size < 8 || off_in_dir + block_size > size)
             break;
-        u16 *entries = (u16 *)(block + 8);
         u32 n = (block_size - 8) / 2;
         for (u32 i = 0; i < n; i++) {
-            u16 e = entries[i];
+            u16 e = *(u16 *)(block + 8 + i * 2);
             u32 type = e >> 12, off = e & 0xFFF;
+            /* page_rva + off must itself land inside the image before
+               we write through it — page_rva comes straight from the
+               file, just like everything else here */
+            if ((uptr)page_rva + off + 8 > img_size)
+                continue;
             if (type == IMAGE_REL_BASED_HIGHLOW)
                 *(u32 *)(loaded_base + page_rva + off) += (u32)delta;
             else if (type == IMAGE_REL_BASED_DIR64)
                 *(u64 *)(loaded_base + page_rva + off) += (u64)delta;
         }
-        block += block_size;
+        off_in_dir += block_size;
     }
     (void)f;
 }
@@ -366,20 +412,18 @@ int pe_run(const rd_file_t *f, const char *cmdline)
         goto fail_unmap;
     }
 
-    /* image is now addressable at its ImageBase: build it */
-    memset((void *)base, 0, (usize)pages * PAGE_SIZE);
-    memcpy((void *)base, f->data,
-           pe.opt->size_of_headers < f->size ? pe.opt->size_of_headers
-                                             : f->size);
-    for (u32 i = 0; i < pe.coff->num_sections; i++) {
-        const section_header_t *s = &pe.sections[i];
-        u32 copy = s->raw_size < s->virtual_size ? s->raw_size
-                                                 : s->virtual_size;
-        memcpy((void *)(base + s->virtual_addr), f->data + s->raw_ptr, copy);
-    }
-    apply_relocs(f, &pe, base);
-
-    /* run it */
+    /*
+     * Everything from here on touches attacker-controlled offsets:
+     * copying header/section data at file-supplied positions, applying
+     * relocations, and walking the import table. pe_parse()/
+     * resolve_imports() are defended against integer overflow and
+     * out-of-bounds offsets directly, but the fault-isolation net
+     * needs to cover this whole sequence too, not just the eventual
+     * entry-point call — a bug here (found or not-yet-found) should
+     * kill this one process, not panic the kernel. So the process is
+     * set up and k_setjmp() established *before* any of it runs, and
+     * proc.running is set true for the entire span.
+     */
     process_t proc;
     memset(&proc, 0, sizeof(proc));
     proc.name = f->name;
@@ -389,29 +433,47 @@ int pe_run(const rd_file_t *f, const char *cmdline)
             sizeof(proc.cmdline) - 1);
     current_process = &proc;
 
-    /* native-Windows-style: resolve DLL imports and patch the IAT */
-    bool win_style = false;
-    err = resolve_imports(base, &pe, &win_style);
-    if (err) {
-        kprintf("exec: %s: %s\n", f->name, err);
-        current_process = NULL;
-        goto fail_unmap; /* mapped == pages here; frees everything */
-    }
-
     int jmp = k_setjmp(proc.exit_jmp);
     if (jmp == 0) {
-        uptr entry = base + pe.opt->entry_point;
         proc.running = true;
-        if (win_style)
-            /* Windows convention: entry takes no args; the program
-               talks to the OS purely through its imports */
-            proc.exit_code = ((int (*)(void))entry)();
-        else
-            /* legacy AlphaOS convention: API table on the stack */
-            proc.exit_code =
-                ((int (*)(const alpha_api_t *))entry)(api_table());
+
+        memset((void *)base, 0, (usize)pages * PAGE_SIZE);
+        memcpy((void *)base, f->data,
+               pe.opt->size_of_headers < f->size ? pe.opt->size_of_headers
+                                                 : f->size);
+        for (u32 i = 0; i < pe.coff->num_sections; i++) {
+            const section_header_t *s = &pe.sections[i];
+            u32 copy = s->raw_size < s->virtual_size ? s->raw_size
+                                                     : s->virtual_size;
+            memcpy((void *)(base + s->virtual_addr), f->data + s->raw_ptr,
+                   copy);
+        }
+        apply_relocs(f, &pe, base);
+
+        /* native-Windows-style: resolve DLL imports and patch the IAT */
+        bool win_style = false;
+        const char *ierr = resolve_imports(base, &pe, &win_style);
+        if (ierr) {
+            kprintf("exec: %s: %s\n", f->name, ierr);
+            proc.exit_code = -1;
+        } else {
+            uptr entry = base + pe.opt->entry_point;
+            if (win_style) {
+                /* Windows convention: entry takes no args; the program
+                   talks to the OS purely through its imports. Reset
+                   the small CRT-ish state (TLS slots, atexit table) so
+                   a previous process's registrations can't leak into
+                   this one — AlphaOS only ever runs one process at a
+                   time, so this is the only reset point ever needed. */
+                win32_reset_process_state();
+                proc.exit_code = ((int (*)(void))entry)();
+            } else
+                /* legacy AlphaOS convention: API table on the stack */
+                proc.exit_code =
+                    ((int (*)(const alpha_api_t *))entry)(api_table());
+        }
     }
-    /* jmp==1: app called exit(); jmp==2: app crashed and was killed */
+    /* jmp==1: app called exit(); jmp==2: crashed (bad file or bad app) */
     proc.running = false;
     sti(); /* a fault longjmp arrives here with interrupts off */
 

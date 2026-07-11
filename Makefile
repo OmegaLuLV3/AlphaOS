@@ -36,7 +36,8 @@ KLDFLAGS := -m elf_x86_64 -T kernel/linker.ld -nostdlib
 KOBJS := boot.o setjmp.o isr.o kernel.o console.o serial.o string.o \
          gdt.o idt.o pic.o pit.o keyboard.o pmm.o paging.o kheap.o \
          ramdisk.o pe.o api.o shell.o \
-         pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o win32.o
+         pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o win32.o \
+         ai.o
 KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------
@@ -48,6 +49,15 @@ APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
 WINAPPS  := winhello msgbox
 WIN_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(WINAPPS)))
 IMPORTS  := apps/win32/imports.list
+
+# ---- compat: real third-party-toolchain binaries, built only if a
+# mingw-w64 cross compiler is present, to regression-test Win32
+# compatibility against something AlphaOS's own toolchain didn't
+# produce. Silently skipped otherwise — never required for `make`.
+MINGW_CC := $(shell command -v x86_64-w64-mingw32-gcc 2>/dev/null)
+ifneq ($(MINGW_CC),)
+COMPAT_EXES := $(BUILD)/apps/mingw_hello.exe
+endif
 
 .PHONY: all run run-vga test clean
 
@@ -108,8 +118,11 @@ $(WIN_EXES): $(BUILD)/apps/%.exe: $(BUILD)/apps/%.winelf tools/mkpe.py \
 	    --entry 0x1100 --imports $(IMPORTS) \
 	    --bss 0x$$(nm $< | awk '$$3=="__bss_size"{print $$1}')
 
-$(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) tools/mkinitrd.py
-	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES)
+$(BUILD)/apps/mingw_hello.exe: compat/mingw_hello.c | $(BUILD)/apps
+	$(MINGW_CC) -O2 -o $@ $<
+
+$(BUILD)/initrd.img: $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES) tools/mkinitrd.py
+	$(PYTHON) tools/mkinitrd.py $@ $(APP_EXES) $(WIN_EXES) $(COMPAT_EXES)
 
 # ---- bootable ISO -----------------------------------------------------
 #
@@ -135,6 +148,22 @@ run: all
 
 run-vga: all
 	$(QEMU) -serial stdio
+
+# run-ai: boots with a second serial port (COM2) exposed as a Unix
+# socket for tools/ai_bridge.py to attach to. The AI channel does
+# nothing on its own — nothing listens on that socket, and the `ai`
+# shell command just times out — until you separately run the bridge
+# with your own ANTHROPIC_API_KEY. That's deliberate: the feature is
+# opt-in on both the guest (typing `ai ...`) and the host (starting the
+# bridge process) sides.
+#
+# -serial mon:stdio (not plain -nographic) is deliberate: adding a
+# second -serial flag for the AI channel suppresses -nographic's own
+# implicit serial-to-stdio wiring, so without this your keystrokes go
+# to the QEMU monitor instead of the AlphaOS shell.
+run-ai: all
+	$(QEMU) -display none -serial mon:stdio \
+	    -serial unix:$(BUILD)/aichan.sock,server=on,wait=off
 
 test: all
 	./tools/run_tests.sh

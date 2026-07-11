@@ -8,20 +8,20 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.4 -- a lightweight OS that runs .exe files
-  130944 KiB RAM managed | 17872 KiB in use | 8 file(s) on ramdisk
+  AlphaOS 0.5 -- a lightweight OS that runs .exe files
+  130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
-alpha> run winhello.exe with args
-Hello from winhello.exe -- a Win32-style program!
-My imports were resolved from the PE import table.
-GetCommandLineA: "winhello.exe with args"
-VirtualAlloc gave me a page and it works.
-HeapAlloc: 15th triangular number is 120
-GetProcAddress(kernel32, GetTickCount) -> uptime 9080 ms
-winhello: done, calling ExitProcess(0)
-[os] winhello.exe exited with code 0 (60 ms)
+alpha> run mingw_hello.exe
+hello from a REAL mingw-w64 compiled Windows binary
+[os] reclaimed 24 bytes the process left allocated
+[os] mingw_hello.exe exited with code 0 (10 ms)
 ```
+
+That's not one of AlphaOS's own apps — it's `compat/mingw_hello.c`,
+compiled by an **unmodified `x86_64-w64-mingw32-gcc`**, default flags,
+full CRT startup (TLS, critical sections, argc/argv, atexit), no special
+entry point. It just runs.
 
 ![start menu](docs/screenshot-startmenu.png)
 *The desktop: terminal window running the shell, start menu, taskbar
@@ -76,6 +76,21 @@ the AlphaOS windowing API.*
   dialog with an OK button. Unresolved imports fail the load with the
   missing `dll!symbol` named. Legacy AlphaOS-API programs (no imports)
   still run; the loader picks the convention per binary.
+- **Enough of a CRT to run real third-party binaries, not just our
+  own** — a `msvcrt.dll` module (`__getmainargs`, `__iob_func`,
+  `_initterm`, `_onexit`/`_cexit`, `malloc`/`calloc`/`free`,
+  `fprintf`/`vfprintf`/`fwrite`, `strlen`/`strncmp`/`memcpy`, ...)
+  plus the rest of default-toolchain CRT startup's kernel32 needs
+  (critical sections — safe no-ops, since AlphaOS never runs two
+  processes at once; a small TLS slot table; `VirtualProtect`/
+  `VirtualQuery`) and a **minimal TEB/PEB** so the `gs:0x30`
+  (`NtCurrentTeb()`) idiom every CRT startup checks doesn't fault on
+  a segment base that was never set up. `malloc`/`HeapAlloc`/
+  `VirtualAlloc` all route through the same per-process tracker as
+  everything else, so a CRT-heavy program that leaks still gets fully
+  reclaimed. Proven against `compat/mingw_hello.c` (see above) — a
+  completely ordinary, default-flags mingw-w64 build, not a specially
+  minimized one.
 - **GUI desktop (Windows-7 style)** — gradient wallpaper, overlapping
   draggable windows with alpha-blended "glass" title bars and drop
   shadows, a taskbar with a start orb, per-window buttons and a live RTC
@@ -109,20 +124,44 @@ the AlphaOS windowing API.*
   - `mem`, `sysinfo.exe`, and the `meminfo` API expose live statistics.
 - **Fault isolation** — CPU exceptions inside an app kill the process,
   not the OS (`crash.exe` demos a null dereference; page 0 is unmapped
-  so null pointers actually fault).
+  so null pointers actually fault). This is the property a real
+  security audit pass hardened end-to-end — see
+  [`SECURITY.md`](SECURITY.md) for what was found (several ways a
+  malformed `.exe` could previously panic the whole kernel instead of
+  just failing to load) and fixed, with working exploit-style test
+  files proving the fixes hold.
+- **AI assistant, safely split across the trust boundary** — an `ai
+  <question>` shell command backed by the real Claude API. AlphaOS has
+  no network/TLS stack (and won't grow one here — that's its own
+  project), so `kernel/ai.c` talks a tiny allowlisted protocol over a
+  second serial port to `tools/ai_bridge.py`, a host process that holds
+  the actual API key. The guest-side handler is a closed five-way
+  switch (`list_files`, `read_pe_info`, `mem_stats`, `pci_list`,
+  `run_exe`) — there is no write/delete/shutdown opcode anywhere in the
+  protocol, structurally, not just by prompt. `run_exe` (the one tool
+  with a real effect) is off by default on the bridge and, even when
+  enabled, requires a human to confirm each call interactively before
+  it's forwarded. See `kernel/ai.c`'s header comment for the full
+  threat model, and `tools/ai_bridge.py --mock` to exercise the whole
+  guest↔host protocol with no API key and no network call at all.
 
 ## Building and running
 
 Requirements: `gcc` (with x86-64 support — the default on most Linux
 distros), `binutils`, `make`, `python3`, `qemu-system-x86_64`,
 `grub-mkrescue` + `xorriso` (to build the bootable ISO — see below for
-why). No cross-compiler needed.
+why). Optional: `x86_64-w64-mingw32-gcc` (mingw-w64) to build and
+regression-test the real third-party compat binary — skipped cleanly
+if absent. No cross-compiler needed for AlphaOS itself.
 
 ```sh
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (34 assertions)
+make test     # scripted end-to-end boot test (37 assertions)
+make run-ai   # boot with the AI assistant's serial channel exposed;
+              # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
+              # (or --mock to try it with no API key at all)
 ```
 
 In the GUI: click the orb for the start menu, launch `paint.exe`, drag
@@ -161,6 +200,7 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `paint.exe` | **GUI app**: opens its own window, mouse drawing, palette |
 | `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
 | `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |
+| `compat/mingw_hello.c` → `mingw_hello.exe` | **real third-party binary**: unmodified default `x86_64-w64-mingw32-gcc` output, full CRT — built only if mingw-w64 is installed |
 
 ## How a `.exe` is born and executed
 
@@ -219,12 +259,17 @@ far the loader gets before it needs something AlphaOS doesn't provide.
 kernel/   boot.S (long-mode transition), GDT/IDT (64-bit), drivers
           (pci, bga, mouse, kbd, rtc, serial, font), pmm, paging
           (4-level), kheap, ramdisk, PE32+ loader + import resolver,
-          Win32 API (win32.c, ms_abi), AlphaOS API, gfx primitives,
-          window manager/compositor, terminal, shell
+          Win32/msvcrt API (win32.c, ms_abi), ai.c (AI channel),
+          AlphaOS API, gfx primitives, window manager/compositor,
+          terminal, shell
 apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
           Windows-style runtime (win32.h, wincrt0.S, imports.list)
+compat/   mingw_hello.c — built by a real mingw-w64 cross compiler,
+          not AlphaOS's own toolchain, to regression-test genuine
+          third-party Win32 binary compatibility
 boot/     grub.cfg for the bootable ISO
 tools/    mkpe.py (flat binary → PE32+ w/ import tables), mkimports.py,
-          mkinitrd.py, run_tests.sh
+          mkinitrd.py, run_tests.sh, ai_bridge.py (host half of `ai`)
 include/  alpha_api.h — the kernel↔app ABI, shared by both sides
+SECURITY.md — audit findings, fixes, and honestly-disclosed limitations
 ```

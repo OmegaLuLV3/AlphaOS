@@ -6,6 +6,12 @@ set -u
 BUILD=${BUILD:-build}
 LOG=$BUILD/test.log
 
+# mingw_hello.exe only exists if a mingw-w64 cross compiler was present
+# at build time (see Makefile's COMPAT_EXES) — assert on it when it is,
+# skip cleanly when it isn't, so this suite passes on either setup.
+HAVE_MINGW=0
+[ -f "$BUILD/apps/mingw_hello.exe" ] && HAVE_MINGW=1
+
 feed() {
     # GRUB (SeaBIOS -> GRUB2 -> our kernel) adds a few seconds versus a
     # direct -kernel boot, so give it more time before the first command
@@ -14,10 +20,15 @@ feed() {
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
                "peinfo winhello.exe" "run winhello.exe with args" \
                "run crash.exe" "run nope.exe" "echo still alive" \
-               "lspci" "date" "mem" "uptime" "halt"; do
+               "lspci" "date" "mem" "uptime"; do
         printf '%s\n' "$cmd"
         sleep 1
     done
+    if [ "$HAVE_MINGW" = 1 ]; then
+        printf 'run mingw_hello.exe\n'
+        sleep 1.5
+    fi
+    printf 'halt\n'
 }
 
 # QEMU's own multiboot loader (-kernel) only accepts 32-bit ELF kernels;
@@ -40,7 +51,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.4"
+check "AlphaOS 0.5"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -74,6 +85,13 @@ check "crash.exe exited with code -1"
 check "not found"                                  # run nope.exe error path
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command
+if [ "$HAVE_MINGW" = 1 ]; then
+    check "msvcrt.dll"                                 # win32_init log line
+    check "hello from a REAL mingw-w64 compiled Windows binary"
+    check "mingw_hello.exe exited with code 0"         # genuine 3rd-party .exe ran
+else
+    echo "SKIP: mingw-w64 compat checks (no cross compiler at build time)"
+fi
 check "powering off"
 
 echo

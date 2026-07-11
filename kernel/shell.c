@@ -12,6 +12,7 @@ static void cmd_help(void)
            "  mem             physical memory and heap statistics\n"
            "  lspci           list devices on the PCI bus\n"
            "  date            read the real-time clock\n"
+           "  ai <question>   ask the AI assistant (needs ai_bridge.py)\n"
            "  uptime          time since boot\n"
            "  clear           clear the screen\n"
            "  echo <text>     print text\n"
@@ -145,6 +146,12 @@ void shell_run(void)
             cmd_lspci();
         else if (strcmp(line, "date") == 0)
             cmd_date();
+        else if (strcmp(line, "ai") == 0) {
+            if (*arg)
+                ai_ask(arg);
+            else
+                kprint("usage: ai <question>\n");
+        }
         else if (strcmp(line, "clear") == 0)
             console_clear();
         else if (strcmp(line, "echo") == 0)

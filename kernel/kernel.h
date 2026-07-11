@@ -54,6 +54,7 @@ usize strlen(const char *s);
 int   strcmp(const char *a, const char *b);
 int   strncmp(const char *a, const char *b, usize n);
 char *strncpy(char *dst, const char *src, usize n);
+char *strchr(const char *s, int c);
 
 /* ---- console.c ----------------------------------------------------- */
 void console_init(void);
@@ -63,11 +64,17 @@ void kputc(char c);
 void kprint(const char *s);
 void kprintf(const char *fmt, ...);
 void panic(const char *msg) __attribute__((noreturn));
+void console_capture_start(char *buf, u32 max); /* mirror kputc into buf */
+void console_capture_stop(void);
 
 /* ---- serial.c ------------------------------------------------------ */
 void serial_init(void);
 void serial_putc(char c);
 int  serial_getc(void); /* -1 if no byte pending */
+
+/* ---- ai.c: host-bridged AI assistant channel (COM2) ------------------ */
+void ai_init(void);
+void ai_ask(const char *question); /* blocking; prints the reply */
 
 /* ---- gdt.c / idt.c ------------------------------------------------- */
 void gdt_init(void);
@@ -213,6 +220,7 @@ void pe_info(const rd_file_t *file);     /* print PE headers */
 /* ---- win32.c: Win32-compatible export tables ------------------------- */
 void  win32_init(void);
 void *win_resolve(const char *dll, const char *func);
+void  win32_reset_process_state(void); /* call before each win-style entry */
 
 /* ---- window manager (wm.c) ------------------------------------------ */
 #define WM_EVQ_SIZE 32

@@ -64,6 +64,14 @@ int strncmp(const char *a, const char *b, usize n)
     return n ? (u8)*a - (u8)*b : 0;
 }
 
+char *strchr(const char *s, int c)
+{
+    for (; *s; s++)
+        if (*s == (char)c)
+            return (char *)s;
+    return c == 0 ? (char *)s : NULL;
+}
+
 char *strncpy(char *dst, const char *src, usize n)
 {
     usize i;

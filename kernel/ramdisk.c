@@ -37,12 +37,22 @@ void ramdisk_init(multiboot_info_t *mbi)
     }
 
     u32 count = *(const u32 *)(base + 4);
+    /* clamp BEFORE reading any entry: count is otherwise unvalidated
+       archive-header data, and without this a large count would walk
+       the entry table past the module's actual mapped size */
+    u32 max_by_size = (mod_size - 8) / sizeof(arfs_entry_t);
+    if (count > max_by_size)
+        count = max_by_size;
     if (count > MAX_FILES)
         count = MAX_FILES;
 
     const arfs_entry_t *ents = (const arfs_entry_t *)(base + 8);
     for (u32 i = 0; i < count; i++) {
-        if (ents[i].offset + ents[i].size > mod_size)
+        /* uptr-widened: offset/size are raw archive data, and adding
+           two u32s that could sum past UINT32_MAX would wrap the
+           bounds check small instead of failing it (see kernel/pe.c
+           for the same bug class, found and fixed there first) */
+        if ((uptr)ents[i].offset + ents[i].size > mod_size)
             continue;
         strncpy(names[nfiles], ents[i].name, 31);
         files[nfiles].name = names[nfiles];

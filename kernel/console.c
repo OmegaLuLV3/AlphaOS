@@ -12,6 +12,36 @@ static u8 cur_x, cur_y;
 static u8 color = 0x07; /* light grey on black */
 static bool gui_console;  /* route output to the terminal window */
 
+/* Capture mode: while active, every character kputc() writes still goes
+   to the real console (so a human watching the screen sees exactly what
+   the AI assistant is inspecting) but is *also* copied into a caller
+   buffer, letting kernel code reuse existing kprintf-based dump
+   routines (pe_info, lspci, ...) as the backend for ai.c's tools. */
+static char *capture_buf;
+static u32 capture_max, capture_len;
+
+void console_capture_start(char *buf, u32 max)
+{
+    capture_buf = buf;
+    capture_max = max;
+    capture_len = 0;
+    if (max)
+        buf[0] = 0;
+}
+
+void console_capture_stop(void)
+{
+    capture_buf = NULL;
+}
+
+static void capture_putc(char c)
+{
+    if (capture_buf && capture_len + 1 < capture_max) {
+        capture_buf[capture_len++] = c;
+        capture_buf[capture_len] = 0;
+    }
+}
+
 void console_use_gui(void)
 {
     gui_console = true;
@@ -66,6 +96,7 @@ void console_set_color(u8 fg, u8 bg)
 
 void kputc(char c)
 {
+    capture_putc(c);
     if (c == '\n')
         serial_putc('\r');
     serial_putc(c);
