@@ -8,7 +8,7 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.8 -- a lightweight OS that runs .exe files
+  AlphaOS 0.9 -- a lightweight OS that runs .exe files
   130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
@@ -139,10 +139,26 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   | `pit.c` | 8254 timer (IRQ 0) | 100 Hz tick, sleep, uptime |
   | `serial.c` | 16550 UART | full headless console + logs |
   | `font.c` | VGA | captures the BIOS 8×16 font for the GUI |
+  | `net.c` | Realtek RTL8139 NIC | Ethernet/ARP/IPv4/ICMP, `ping` |
 
   Balanced by design: if the display adapter is missing (e.g. unusual
   real hardware), the OS degrades gracefully to the VGA text-mode shell —
-  every feature except windows still works.
+  every feature except windows still works. Same for the NIC: no RTL8139
+  present, no network — everything else keeps working.
+- **A real network stack, first slice** — `net.c` drives an RTL8139 NIC
+  directly (PCI enable, ring-buffer RX/TX, IRQ-driven receive) and
+  implements just enough of Ethernet/ARP/IPv4/ICMP to send a real ping
+  and get a real reply: `ping` at the shell resolves the gateway's MAC
+  over ARP, sends an ICMP echo request, and reports the round trip —
+  genuinely over emulated hardware (QEMU's SLIRP backend), not a
+  loopback shortcut. This is the foundation step for two much bigger
+  asks (a browser, pulling updates from GitHub): both need a real
+  network stack under them before anything else is possible, so that's
+  what got built first. No TCP/DNS/TLS yet — see the roadmap below.
+  Every byte this parses comes off the wire untrusted, and it's
+  threat-modeled that way from the start; see `SECURITY.md` finding
+  #14, including a bug (an integer underflow in malformed-packet
+  handling) caught and fixed by adversarial review before this shipped.
 - **Lightweight** — kernel ~5.3k lines of C/asm; the whole system boots
   to a composited desktop in well under a second.
 - **Resource management**
@@ -204,7 +220,7 @@ for AlphaOS itself.
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (51 assertions)
+make test     # scripted end-to-end boot test (54 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -232,6 +248,7 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `mem` | physical memory and heap statistics |
 | `lspci` | list devices found by the PCI driver |
 | `date` | read the real-time clock |
+| `ping` | ARP-resolve + ICMP-ping the network gateway (needs a NIC) |
 | `uptime`, `echo`, `clear`, `help`, `halt` | the usual |
 
 ## Bundled programs
@@ -312,15 +329,45 @@ imports are reported by name at load time — see `peinfo` on a real
 Windows binary for a demonstration of exactly how far the loader gets
 before it needs something AlphaOS doesn't provide.
 
+## Roadmap: towards a browser and update-from-GitHub
+
+Two frequently-requested capabilities — running a real browser, and an
+auto-updater that pulls new builds from GitHub — aren't feasible as
+literally stated (a real browser needs threads, a dynamic linker, GPU/
+JIT, and the full modern web platform; a GitHub-pulling updater needs
+somewhere persistent to write the update to). Both share the same hard
+prerequisite, so that's what's being built first:
+
+1. **Network stack foundation** — done, first slice: `net.c`'s RTL8139
+   driver + Ethernet/ARP/IPv4/ICMP (`ping`). Still needed: UDP, TCP.
+2. **DNS + a minimal HTTP client** — not started.
+3. **TLS** — not started; almost everything on the modern web requires
+   HTTPS, including GitHub's API and release downloads.
+4. **A disk driver + a real writable filesystem** — not started;
+   storage today is a read-only ramdisk rebuilt at compile time, so
+   there's nowhere to persist a downloaded update (or a browser cache)
+   yet. Required for the updater specifically, not for a browser.
+5. **Update verification + apply** — not started; whatever eventually
+   downloads a new build must be cryptographically verified before
+   it's trusted with anything, the same care this project's whole
+   security model is built around (see `SECURITY.md`).
+6. **A minimal HTML/CSS parser + text-mode renderer** — not started;
+   this is the realistic ceiling for "a browser" here — never Firefox.
+
+Each step gets the same treatment as everything else in this repo:
+built against real protocols/formats, tested against real traffic (not
+mocked), and reviewed adversarially before being called done — see
+`SECURITY.md` finding #14 for how that played out for step 1.
+
 ## Layout
 
 ```
 kernel/   boot.S (long-mode transition), GDT/IDT (64-bit), drivers
-          (pci, bga, mouse, kbd, rtc, serial, font), pmm, paging
-          (4-level), kheap, ramdisk, PE32+ loader + import resolver,
-          Win32/msvcrt API (win32.c, ms_abi), ai.c (AI channel),
-          AlphaOS API, gfx primitives, window manager/compositor,
-          terminal, shell
+          (pci, bga, mouse, kbd, rtc, serial, font, net — RTL8139 +
+          Ethernet/ARP/IPv4/ICMP), pmm, paging (4-level), kheap,
+          ramdisk, PE32+ loader + import resolver, Win32/msvcrt API
+          (win32.c, ms_abi), ai.c (AI channel), AlphaOS API, gfx
+          primitives, window manager/compositor, terminal, shell
 apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
           Windows-style runtime (win32.h, wincrt0.S, imports.list)
 compat/   mingw_hello.c, mingw_winapp.c, mingw_readfile.c — built by a

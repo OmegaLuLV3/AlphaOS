@@ -18,6 +18,14 @@ static u32 cfg_read(u8 bus, u8 slot, u8 func, u8 off)
     return inl(0xCFC);
 }
 
+static void cfg_write(u8 bus, u8 slot, u8 func, u8 off, u32 val)
+{
+    u32 addr = 0x80000000u | ((u32)bus << 16) | ((u32)slot << 11) |
+               ((u32)func << 8) | (off & 0xFC);
+    outl(0xCF8, addr);
+    outl(0xCFC, val);
+}
+
 static const struct {
     u16 vendor, device;
     const char *name;
@@ -31,6 +39,7 @@ static const struct {
     { 0x1234, 0x1111, "QEMU/Bochs VGA display adapter" },
     { 0x1AF4, 0x1000, "virtio network device" },
     { 0x1AF4, 0x1001, "virtio block device" },
+    { 0x10EC, 0x8139, "Realtek RTL8139 ethernet" },
 };
 
 static const char *class_name(u8 class_code)
@@ -63,6 +72,7 @@ static void probe(u8 bus, u8 slot, u8 func)
     d->class_code = cls >> 24;
     d->subclass = (cls >> 16) & 0xFF;
     d->bar0 = cfg_read(bus, slot, func, 0x10);
+    d->irq_line = cfg_read(bus, slot, func, 0x3C) & 0xFF;
 
     d->name = class_name(d->class_code);
     for (u32 i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
@@ -86,6 +96,15 @@ void pci_scan(void)
         }
     }
     kprintf("pci: %u device(s) on the bus\n", ndevices);
+}
+
+/* command register bit0 = I/O space enable, bit2 = bus master enable
+   (needed for a device like the RTL8139 NIC to DMA into RAM at all) */
+void pci_enable_device(pci_dev_t *d)
+{
+    u32 cmd = cfg_read(d->bus, d->slot, d->func, 0x04);
+    cmd |= 0x1 | 0x4;
+    cfg_write(d->bus, d->slot, d->func, 0x04, cmd);
 }
 
 u32 pci_count(void)

@@ -27,6 +27,8 @@ feed() {
         printf '%s\n' "$cmd"
         sleep 1
     done
+    printf 'ping\n'
+    sleep 3
     if [ "$HAVE_MINGW" = 1 ]; then
         printf 'run mingw_hello.exe\n'
         sleep 1.5
@@ -45,8 +47,11 @@ feed() {
 
 # QEMU's own multiboot loader (-kernel) only accepts 32-bit ELF kernels;
 # AlphaOS is now x86-64, so it boots through the GRUB2 rescue ISO instead.
+# -netdev user,id=net0 -device rtl8139,netdev=net0: same reasoning as the
+# Makefile's $(QEMU) — explicit, not relying on QEMU's own default NIC.
 feed | timeout 120 qemu-system-x86_64 -m 128 -vga std \
     -cdrom "$BUILD/alphaos.iso" \
+    -netdev user,id=net0 -device rtl8139,netdev=net0 \
     -nographic -no-reboot | tee "$LOG"
 
 echo
@@ -63,10 +68,11 @@ check() {
     fi
 }
 
-check "AlphaOS 0.8"
+check "AlphaOS 0.9"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
+check "net: RTL8139 at io=.* irq=.* mac=.* ip=10.0.2.15"
 check "bga: 1024x768x32 framebuffer"
 check "gui: desktop ready"
 check "1024x768x32 desktop"
@@ -113,6 +119,11 @@ check "allocbomb.exe exited with code 0"
 check "not found"                                  # run nope.exe error path
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command
+# real network stack: RTL8139 TX/RX, ARP resolution, ICMP echo against
+# QEMU SLIRP's gateway -- a genuine round trip over emulated hardware,
+# not a loopback shortcut
+check "pinging gateway 10.0.2.2"
+check "reply from 10.0.2.2: time="
 if [ "$HAVE_MINGW" = 1 ]; then
     check "hello from a REAL mingw-w64 compiled Windows binary"
     check "mingw_hello.exe exited with code 0"         # genuine 3rd-party .exe ran

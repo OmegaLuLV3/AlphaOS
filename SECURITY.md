@@ -353,9 +353,80 @@ immediately after and writes/reads through it — proving the heap
 wasn't left corrupted by the rejected calls, not just that the calls
 themselves were rejected. `make test`: 51/51 passing.
 
+### 14. A real network stack — the first genuine remote attack surface
+AlphaOS has ever had, threat-modeled from day one
+
+**Where:** `kernel/net.c` (new file): an RTL8139 PCI NIC driver plus
+Ethernet/ARP/IPv4/ICMP parsing, exposed as a `ping` shell command.
+
+Every prior finding in this document was reachable only by a
+*locally-loaded* malicious `.exe` or ramdisk file — there was no code
+path anywhere in the kernel that parsed bytes that arrived over a
+wire. This changes that categorically: `net.c`'s Ethernet/ARP/IPv4/
+ICMP parsers run inside a hardware interrupt handler (`nic_irq()`)
+against whatever bytes QEMU's virtual NIC DMAs into the RX ring —
+structurally the same trust level as a loaded `.exe` file (attacker-
+controlled, must be defended against directly), except now reachable
+by anything that can put a frame on the wire, not just something that
+can get a file onto the ramdisk at build time.
+
+**What's already defended, by construction:**
+- Every parser (`eth_handle_frame`, `arp_handle`, `ip_handle`,
+  `icmp_handle`) checks the received length against its header size
+  *before* reading any field, the same discipline `pe.c`'s PE parser
+  uses against a malicious `.exe`.
+- The RX ring loop (`nic_irq()`) treats the NIC-reported packet length
+  itself as untrusted: a `rx_len` outside `[4, RX_BUF_LEN]` resets the
+  ring pointer and stops, rather than being used to compute a buffer
+  offset; `offset + rx_len <= sizeof(rx_buffer)` is checked before the
+  frame is ever handed to `eth_handle_frame()`.
+- `ip_handle()` validates the IPv4 header length (`ihl`) against the
+  real received byte count (not the packet's own self-reported
+  `total_length`) before ever dereferencing anything past the fixed
+  20-byte header.
+
+**Found and fixed before this was considered done, not shipped
+broken:** an early version of `ip_handle()` checked `total_len > len`
+(reject a header that claims more bytes than actually arrived) but not
+`total_len < ihl` (a header claiming to be *shorter* than its own
+declared header length). That asymmetry meant `total_len - ihl`
+— passed as the payload length into `icmp_handle()` — could underflow
+(`u16`/`u32` arithmetic wrapping to a huge value) on a deliberately
+malformed packet. The pointer arithmetic itself stayed safely inside
+the RX buffer (a separate, already-correct bounds check saw to that),
+but the wrapped length would have let `icmp_handle()` read past this
+packet's real data into whatever a *previous* packet left behind in
+the ring buffer — and, if triggered on the echo-request path, echo up
+to 32 of those stale bytes back to the attacker in a reply. That's a
+narrow but real information-disclosure primitive (leaking fragments of
+a prior packet to whoever sends the next malformed one), caught by
+manual adversarial review of the receive path (the send/happy path was
+already proven correct empirically — see Verification below — but a
+successful ping doesn't exercise malformed-input handling at all).
+Fixed by additionally requiring `total_len >= ihl`.
+
+**Deliberately not yet defended — known, accepted scope for this
+first slice:** no TCP (nothing here parses variable-length TCP
+options or reassembles segments — the highest-complexity, highest-risk
+parsing surface in any network stack — because there is no TCP yet),
+no IP fragmentation reassembly (fragmented packets are simply not
+matched to anything and drop silently — reassembly bugs are a classic
+CVE source and this sidesteps the entire class by not attempting it),
+no promiscuous/multicast reception (`RCR_APM|RCR_AB` only — the NIC
+itself drops anything not addressed to our MAC or broadcast, before
+software ever sees it). Each of these is real future work, not an
+oversight to paper over.
+
+**Verification:** an actual round trip over emulated hardware, not a
+loopback shortcut — `make test`'s `ping` command sends a real ARP
+request, receives a real ARP reply from QEMU's SLIRP gateway, sends a
+real ICMP echo request, and receives a real ICMP echo reply, end to
+end through the RTL8139 TX ring, the IRQ-driven RX ring, and every
+parser above. `make test`: 54/54 passing.
+
 ## Verification
 
-Beyond `make test` (51 assertions, including the malicious-file checks
+Beyond `make test` (54 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 
@@ -473,3 +544,17 @@ exist would be worse than naming them:
   files, not a mechanical sweep of every function in the kernel. Treat
   "audited" as "this specific surface was looked at carefully," not
   "this OS is safe against a motivated attacker."
+- **The network stack (finding #14) is intentionally minimal, not
+  hardened.** No TCP (so no port scanning/connection-flood surface
+  exists yet, but also nothing useful can be built on top of it beyond
+  ping), no fragmentation reassembly, no DNS, no TLS. The IP
+  configuration is a single hardcoded static address matching QEMU's
+  SLIRP defaults — there's no DHCP client, so this driver only makes
+  sense against the exact backend the Makefile configures. Every
+  connection this eventually needs (an HTTP client, an auto-updater
+  pulling from GitHub) requires real transport and TLS layers that
+  don't exist yet; building those without inheriting classic C
+  network-stack vulnerability classes (TCP state-machine bugs, integer
+  overflows in reassembly, certificate-validation bypasses in a home-
+  grown TLS implementation) will need the same care this pass put into
+  finding #14, not less.

@@ -609,7 +609,7 @@ void gui_init(void)
     for (int r = 0; r < 90; r++)
         gfx_blend(&wp, W / 2 - (300 - r * 2), H / 2 - 40 + r / 2,
                   (300 - r * 2) * 2, 1, RGB(0xcc, 0xe4, 0xff), 22);
-    gfx_text(&wp, W - 148, H - TASKBAR_H - 24, "AlphaOS 0.8",
+    gfx_text(&wp, W - 148, H - TASKBAR_H - 24, "AlphaOS 0.9",
              RGB(0xd8, 0xe8, 0xf8));
 
     mx = W / 2;

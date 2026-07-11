@@ -27,3 +27,15 @@ void pic_eoi(u8 irq)
         outb(PIC2_CMD, 0x20);
     outb(PIC1_CMD, 0x20);
 }
+
+/* pic_init() only unmasks the fixed set of IRQs known at compile time
+   (timer, keyboard, cascade, mouse). A PCI device's IRQ line is
+   assigned by the BIOS/firmware and only known after pci_scan() reads
+   it back at runtime, so drivers for such devices (e.g. an RTL8139
+   NIC) call this once they know their own line. */
+void pic_unmask(u8 irq)
+{
+    u16 port = irq < 8 ? PIC1_DATA : PIC2_DATA;
+    u8 bit = irq < 8 ? irq : irq - 8;
+    outb(port, inb(port) & ~(1u << bit));
+}

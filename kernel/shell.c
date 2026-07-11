@@ -12,6 +12,7 @@ static void cmd_help(void)
            "  mem             physical memory and heap statistics\n"
            "  lspci           list devices on the PCI bus\n"
            "  date            read the real-time clock\n"
+           "  ping            ping the network gateway (needs a NIC)\n"
            "  ai <question>   ask the AI assistant (needs ai_bridge.py)\n"
            "  uptime          time since boot\n"
            "  clear           clear the screen\n"
@@ -66,6 +67,23 @@ static void cmd_uptime(void)
     u32 ms = uptime_ms();
     kprintf("up %u.%02us (%u ticks)\n", ms / 1000, (ms % 1000) / 10,
             pit_ticks());
+}
+
+static void cmd_ping(void)
+{
+    if (!net_ready()) {
+        kprint("ping: no NIC (boot with -netdev user,id=net0 "
+               "-device rtl8139,netdev=net0)\n");
+        return;
+    }
+    const u8 *ip = net_gateway_ip();
+    kprintf("pinging gateway %u.%u.%u.%u...\n", ip[0], ip[1], ip[2], ip[3]);
+    u32 rtt;
+    if (net_ping(ip, &rtt))
+        kprintf("reply from %u.%u.%u.%u: time=%ums\n", ip[0], ip[1], ip[2],
+                ip[3], rtt);
+    else
+        kprint("ping: no reply (timed out)\n");
 }
 
 static void cmd_run(const char *cmdline)
@@ -146,6 +164,8 @@ void shell_run(void)
             cmd_lspci();
         else if (strcmp(line, "date") == 0)
             cmd_date();
+        else if (strcmp(line, "ping") == 0)
+            cmd_ping();
         else if (strcmp(line, "ai") == 0) {
             if (*arg)
                 ai_ask(arg);

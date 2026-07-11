@@ -93,6 +93,7 @@ void irq_register(u8 irq, irq_handler_t handler);
 /* ---- pic.c --------------------------------------------------------- */
 void pic_init(void);
 void pic_eoi(u8 irq);
+void pic_unmask(u8 irq);
 
 /* ---- pit.c --------------------------------------------------------- */
 void pit_init(u32 hz);
@@ -116,13 +117,23 @@ typedef struct pci_dev {
     u16 vendor, device;
     u8  class_code, subclass;
     u32 bar0;
+    u8  irq_line;
     const char *name;
 } pci_dev_t;
 
 void       pci_scan(void);
+void       pci_enable_device(pci_dev_t *d); /* I/O space + bus mastering */
 u32        pci_count(void);
 pci_dev_t *pci_get(u32 i);
 pci_dev_t *pci_find(u16 vendor, u16 device);
+
+/* ---- net.c: RTL8139 driver + Ethernet/ARP/IPv4/ICMP ------------------ */
+void       net_init(void);
+bool       net_ready(void);
+bool       net_arp_resolve(const u8 ip[4], u8 mac_out[6]);
+bool       net_ping(const u8 ip[4], u32 *rtt_ms_out);
+const u8  *net_gateway_ip(void);
+const u8  *net_our_ip(void);
 
 /* ---- rtc.c ----------------------------------------------------------*/
 typedef struct rtc_time {

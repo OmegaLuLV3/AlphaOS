@@ -37,7 +37,7 @@ KOBJS := boot.o setjmp.o isr.o kernel.o console.o serial.o string.o \
          gdt.o idt.o pic.o pit.o keyboard.o pmm.o paging.o kheap.o \
          ramdisk.o pe.o api.o shell.o \
          pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o win32.o \
-         ai.o
+         ai.o net.o
 KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------
@@ -154,8 +154,15 @@ $(BUILD)/alphaos.iso: $(BUILD)/kernel.elf $(BUILD)/initrd.img boot/grub.cfg
 	grub-mkrescue -o $@ $(BUILD)/iso
 
 # ---- run / test -----------------------------------------------------
+#
+# -netdev user,id=net0 -device rtl8139,netdev=net0: explicit rather than
+# relying on QEMU's own default NIC (which varies by version/build) —
+# kernel/net.c's driver specifically targets the RTL8139 model and the
+# SLIRP "user" backend's default addressing (guest 10.0.2.15/24,
+# gateway 10.0.2.2). `ping` at the shell exercises the whole stack.
 
-QEMU := qemu-system-x86_64 -m 128 -vga std -cdrom $(BUILD)/alphaos.iso
+QEMU := qemu-system-x86_64 -m 128 -vga std -cdrom $(BUILD)/alphaos.iso \
+        -netdev user,id=net0 -device rtl8139,netdev=net0
 
 run: all
 	$(QEMU) -nographic
