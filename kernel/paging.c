@@ -11,11 +11,21 @@
  * physical), same as the 32-bit design. Everything we care about —
  * kernel, apps, framebuffer — stays below 4 GiB by construction, so a
  * single PML4 entry (covering 512 GiB) is all that's ever used.
+ *
+ * paging_map() takes independent writable/executable flags (backed by
+ * the PTE's NX bit, gated on EFER.NXE which boot.S sets) so callers can
+ * build W^X mappings instead of the old implicit "always executable"
+ * default: kheap_init() marks the whole kernel heap non-executable
+ * (nothing legitimate is ever *code* in there), bga.c marks the
+ * framebuffer non-executable, and pe.c marks a loaded image's real
+ * code sections read-only+executable once relocations/imports are done
+ * writing to them. See SECURITY.md for what this does and doesn't cover.
  */
 #include "kernel.h"
 
 #define PTE_PRESENT 0x1ull
 #define PTE_RW      0x2ull
+#define PTE_NX      (1ull << 63)
 #define ENTRIES     512
 
 static u64 pml4[ENTRIES] __attribute__((aligned(PAGE_SIZE)));
@@ -54,13 +64,15 @@ static u64 *get_pt(uptr virt, int create)
     return walk(pd, pd_i, create);
 }
 
-int paging_map(uptr virt, uptr phys, int writable)
+int paging_map(uptr virt, uptr phys, int writable, int executable)
 {
     u64 *pt = get_pt(virt, 1);
     if (!pt)
         return -1;
     u32 pt_i = (virt >> 12) & 0x1FF;
-    pt[pt_i] = (phys & ~0xFFFull) | PTE_PRESENT | (writable ? PTE_RW : 0);
+    u64 flags = PTE_PRESENT | (writable ? PTE_RW : 0) |
+                (executable ? 0 : PTE_NX);
+    pt[pt_i] = (phys & ~0xFFFull) | flags;
     __asm__ volatile("invlpg (%0)" : : "r"(virt) : "memory");
     return 0;
 }
@@ -89,4 +101,15 @@ void paging_init(void)
     }
 
     paging_enable((uptr)pml4);
+
+    /* CR0.WP: without this, supervisor-mode (ring 0) writes ignore the
+       R/W bit in a PTE entirely -- and every app here runs in ring 0
+       (see kernel.h/pe.c). So a page marked read-only means nothing
+       for W^X purposes until this is set; with it, pe.c's per-section
+       remap of real executable sections to read-only+exec actually
+       denies writes, not just NX-based instruction fetches. */
+    u64 cr0;
+    __asm__ volatile("mov %%cr0, %0" : "=r"(cr0));
+    cr0 |= 0x10000ull;
+    __asm__ volatile("mov %0, %%cr0" : : "r"(cr0));
 }

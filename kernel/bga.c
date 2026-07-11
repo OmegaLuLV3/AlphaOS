@@ -54,10 +54,11 @@ int bga_init(int w, int h)
     vbe_write(VBE_BPP, 32);
     vbe_write(VBE_ENABLE, VBE_ENABLED | VBE_LFB_ENABLED);
 
-    /* the LFB lives far above RAM: map it identity into kernel space */
+    /* the LFB lives far above RAM: map it identity into kernel space.
+       It's pixel data, never code -- non-executable. */
     u32 size = PAGE_ALIGN_UP((u32)w * h * 4);
     for (u32 off = 0; off < size; off += PAGE_SIZE) {
-        if (paging_map(fb_phys + off, fb_phys + off, 1) < 0) {
+        if (paging_map(fb_phys + off, fb_phys + off, 1, 0) < 0) {
             kprint("bga: failed to map framebuffer\n");
             return -1;
         }

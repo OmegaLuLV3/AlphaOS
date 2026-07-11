@@ -171,7 +171,7 @@ uptr pmm_managed_end(void);
 
 /* ---- paging.c ------------------------------------------------------ */
 void paging_init(void);
-int  paging_map(uptr virt, uptr phys, int writable);
+int  paging_map(uptr virt, uptr phys, int writable, int executable);
 void paging_unmap(uptr virt);
 void tlb_flush(void);
 

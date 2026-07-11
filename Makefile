@@ -42,7 +42,7 @@ KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------
 
-APPS     := hello sysinfo memhog primes crash paint
+APPS     := hello sysinfo memhog primes crash paint noexec
 APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
 
 # Windows-style apps: call the OS via PE imports (kernel32/user32)

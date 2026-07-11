@@ -111,10 +111,14 @@ _start:
     mov $boot_pml4, %eax
     mov %eax, %cr3
 
-    /* long mode enable (EFER.LME, MSR 0xC0000080 bit 8) */
+    /* long mode enable (EFER.LME, MSR 0xC0000080 bit 8), plus NXE
+       (bit 11) so kernel/paging.c can later mark pages non-executable
+       -- the NX bit in a PTE is simply ignored by the CPU until EFER.NXE
+       is set, so this has to happen here even though nothing uses NX
+       yet; paging_init() replaces this whole temporary map anyway */
     mov $0xC0000080, %ecx
     rdmsr
-    or  $0x100, %eax
+    or  $0x900, %eax
     wrmsr
 
     /* enable paging -> CPU is now in IA-32e compatibility submode */

@@ -29,6 +29,17 @@ void kheap_init(void)
     if (!base)
         panic("kheap: cannot allocate heap region");
 
+    /* W^X: this heap backs every kmalloc/kfree in the kernel *and*
+       every app-side allocator that routes through it (VirtualAlloc,
+       HeapAlloc, malloc, AlphaOS's own alloc -- see api.c's
+       proc_alloc()). None of that is ever legitimately code, so
+       marking the whole region non-executable closes off the classic
+       "corrupt a pointer, jump into heap-sprayed shellcode" primitive
+       for every allocation in the system in one place, rather than
+       needing to reason about it per call site. */
+    for (uptr off = 0; off < HEAP_SIZE; off += PAGE_SIZE)
+        paging_map(base + off, base + off, 1, 0);
+
     heap_head = (block_t *)base;
     heap_head->magic = BLOCK_MAGIC;
     heap_head->size = HEAP_SIZE - HDR;

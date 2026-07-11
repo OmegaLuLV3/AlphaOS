@@ -137,7 +137,7 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   Balanced by design: if the display adapter is missing (e.g. unusual
   real hardware), the OS degrades gracefully to the VGA text-mode shell —
   every feature except windows still works.
-- **Lightweight** — kernel ~3.8k lines of C/asm; the whole system boots
+- **Lightweight** — kernel ~5.3k lines of C/asm; the whole system boots
   to a composited desktop in well under a second.
 - **Resource management**
   - Bitmap physical-memory manager + kernel heap with coalescing.
@@ -154,6 +154,21 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   malformed `.exe` could previously panic the whole kernel instead of
   just failing to load) and fixed, with working exploit-style test
   files proving the fixes hold.
+- **W^X / NX enforcement** — `EFER.NXE` and `CR0.WP` are enabled at
+  boot, and `paging_map()` carries independent writable/executable
+  flags backed by the page table's NX bit. The kernel heap (which
+  backs every `kmalloc`/`VirtualAlloc`/`HeapAlloc`/`malloc` allocation
+  in the system) and the framebuffer are fully non-executable; a loaded
+  `.exe`'s real code sections (execute-without-write, as a genuine
+  toolchain emits) become read-only + executable once the loader is
+  done writing into them, closing off "corrupt memory, then jump into
+  it" for the memory that actually holds attacker-influenced bytes.
+  `noexec.exe` proves the heap side directly — it writes a `ret`
+  instruction into a heap buffer and calls it, which now page-faults
+  (instruction-fetch NX violation) instead of executing. See
+  [`SECURITY.md`](SECURITY.md) finding #12 for the full writeup,
+  including the one case this doesn't cover yet (AlphaOS's own
+  `mkpe.py`-built apps still ship as a single RWX section).
 - **AI assistant, safely split across the trust boundary** — an `ai
   <question>` shell command backed by the real Claude API. AlphaOS has
   no network/TLS stack (and won't grow one here — that's its own
@@ -183,7 +198,7 @@ for AlphaOS itself.
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (38 assertions)
+make test     # scripted end-to-end boot test (41 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -222,6 +237,7 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `primes.exe` | CPU work + heap allocation (sieve of Eratosthenes) |
 | `memhog.exe` | leak reclamation: frees half its buffers, OS reclaims the rest |
 | `crash.exe` | fault isolation: null deref kills the app, not the OS |
+| `noexec.exe` | W^X: writes code into a heap buffer and jumps to it — now page-faults (NX) instead of running |
 | `paint.exe` | **GUI app**: opens its own window, mouse drawing, palette |
 | `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
 | `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |

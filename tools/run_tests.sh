@@ -19,7 +19,8 @@ feed() {
     for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
                "sysinfo.exe" "run primes.exe" "run memhog.exe" \
                "peinfo winhello.exe" "run winhello.exe with args" \
-               "run crash.exe" "run nope.exe" "echo still alive" \
+               "run crash.exe" "run noexec.exe" "run nope.exe" \
+               "echo still alive" \
                "lspci" "date" "mem" "uptime"; do
         printf '%s\n' "$cmd"
         sleep 1
@@ -89,6 +90,9 @@ check "winhello.exe exited with code 0"
 check "\[fault\]"                                  # crash.exe page fault
 check "killing process 'crash.exe'"                # fault isolation kicked in
 check "crash.exe exited with code -1"
+check "about to jump into heap-allocated bytes"    # noexec.exe started
+check "killing process 'noexec.exe'"               # heap is really NX: the
+check "noexec.exe exited with code -1"             # ret stub faulted, didn't run
 check "not found"                                  # run nope.exe error path
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command

@@ -20,6 +20,9 @@
  */
 #include "kernel.h"
 
+#define IMAGE_SCN_MEM_EXECUTE 0x20000000u
+#define IMAGE_SCN_MEM_WRITE   0x80000000u
+
 /* ---- PE structures (subset) ---------------------------------------- */
 
 typedef struct {
@@ -378,6 +381,41 @@ static void apply_relocs(const rd_file_t *f, const pe_view_t *pe,
     (void)f;
 }
 
+/*
+ * W^X: every page was mapped writable+non-executable when the image
+ * was loaded (see the initial paging_map() loop above); once
+ * everything that needs to write into it (section copy, relocations,
+ * IAT patching) is done, grant execute permission to the pages that
+ * actually declare IMAGE_SCN_MEM_EXECUTE — every other page (headers,
+ * pure data, bss, alignment gaps) stays non-executable and needs no
+ * change here.
+ *
+ * A section that declares EXECUTE without WRITE (real .text from a
+ * genuine toolchain, e.g. mingw-w64) additionally loses write access:
+ * that's the actual W^X enforcement, closing off "corrupt a code page,
+ * then jump into it" for such images. A section that declares *both*
+ * EXECUTE and WRITE keeps both — that's AlphaOS's own apps (built by
+ * tools/mkpe.py, which emits a single RWX section; see its header
+ * comment), whose own IAT patching and writable globals live in that
+ * same section, so denying writes there would just break them without
+ * adding real security. A proper split would need mkpe.py/app.ld to
+ * stop emitting one RWX section; noted as future work in SECURITY.md.
+ */
+static void harden_sections(uptr base, const pe_view_t *pe, const uptr *frames)
+{
+    for (u32 i = 0; i < pe->coff->num_sections; i++) {
+        const section_header_t *s = &pe->sections[i];
+        u32 c = s->characteristics;
+        if (!(c & IMAGE_SCN_MEM_EXECUTE))
+            continue;
+        int writable = (c & IMAGE_SCN_MEM_WRITE) != 0;
+        uptr start = PAGE_ALIGN_DOWN(s->virtual_addr);
+        uptr end = PAGE_ALIGN_UP((uptr)s->virtual_addr + s->virtual_size);
+        for (uptr off = start; off < end; off += PAGE_SIZE)
+            paging_map(base + off, frames[off / PAGE_SIZE], writable, 1);
+    }
+}
+
 int pe_run(const rd_file_t *f, const char *cmdline)
 {
     pe_view_t pe;
@@ -400,7 +438,11 @@ int pe_run(const rd_file_t *f, const char *cmdline)
     u32 mapped = 0;
     for (; mapped < pages; mapped++) {
         uptr phys = pmm_alloc_frame();
-        if (!phys || paging_map(base + mapped * PAGE_SIZE, phys, 1) < 0) {
+        /* mapped writable, non-executable for now -- headers, sections,
+           and relocations all need to be written into this image before
+           anything runs; harden_sections() below tightens real code
+           pages to read-only+executable once that writing is done */
+        if (!phys || paging_map(base + mapped * PAGE_SIZE, phys, 1, 0) < 0) {
             if (phys)
                 pmm_free_frame(phys);
             break;
@@ -457,6 +499,7 @@ int pe_run(const rd_file_t *f, const char *cmdline)
             kprintf("exec: %s: %s\n", f->name, ierr);
             proc.exit_code = -1;
         } else {
+            harden_sections(base, &pe, frames);
             uptr entry = base + pe.opt->entry_point;
             if (win_style) {
                 /* Windows convention: entry takes no args; the program

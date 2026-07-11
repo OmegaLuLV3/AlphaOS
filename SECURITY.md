@@ -218,9 +218,83 @@ processes concurrently and the kernel's own code never touches
 XMM/x87 state, so there is no second execution context whose SSE
 state could ever collide with an app's.
 
+### 12. W^X / NX enforcement added — **hardening, closes the "known
+limitation" named below in this same file for real .exe images and the
+kernel heap**
+
+**Where:** `kernel/boot.S`, `kernel/paging.c`, `kernel/pe.c`,
+`kernel/kheap.c`, `kernel/bga.c`.
+
+Previously every mapped page — app image, kernel heap, framebuffer —
+was Read+Write and implicitly executable, with no NX bit usage
+anywhere (named explicitly as a known limitation below). A bug
+anywhere that let an attacker control a jump/call target and place
+bytes of their choosing in memory (a classic buffer-overflow-to-
+shellcode primitive) had no additional barrier stopping code execution
+in that memory, on top of whatever the bug itself already allowed.
+
+Fixed in three parts:
+
+- **EFER.NXE** is now set at the same time as EFER.LME in `boot.S`
+  (previously never set at all, so the CPU ignored the NX bit in any
+  PTE unconditionally). `paging_map()` now takes independent
+  `writable`/`executable` flags backed by the PTE's NX bit (bit 63)
+  instead of always mapping pages executable.
+- **`CR0.WP` is now set** in `paging_init()`. This matters specifically
+  *because* AlphaOS runs every app in ring 0 (see "Known limitations"
+  below): without `CR0.WP`, supervisor-mode writes ignore a PTE's R/W
+  bit entirely, so marking a page "read-only" would be a no-op for any
+  code running at the kernel's own privilege level — which is all of
+  it. With `CR0.WP` set, a read-only mapping is actually enforced
+  regardless of ring.
+- **The kernel heap is now mapped non-executable in one place**
+  (`kheap_init()`, right after the region is carved out of physical
+  RAM) — this covers every `kmalloc`/`VirtualAlloc`/`HeapAlloc`/
+  `malloc`/AlphaOS-`alloc` allocation in the system at once, since they
+  all route through the same heap (see `api.c`'s `proc_alloc()`),
+  closing off "corrupt a pointer, jump into heap-sprayed shellcode" for
+  the entire system rather than needing per-call-site reasoning. The
+  framebuffer (`bga.c`) is likewise mapped non-executable — it's pixel
+  data, never code.
+- **Loaded `.exe` images get real per-section W^X**
+  (`pe.c:harden_sections()`). Every page is mapped writable+non-executable
+  while the loader is still writing into the image (section copy,
+  relocations, IAT patching); once that's done, pages belonging to a
+  section that declares `IMAGE_SCN_MEM_EXECUTE` get execute permission,
+  and — if that section does *not* also declare `IMAGE_SCN_MEM_WRITE` —
+  lose write permission too. A genuine toolchain's `.text` (mingw-w64
+  included) declares execute-without-write, so this is real W^X for
+  real binaries: `compat/mingw_hello.c` and `compat/mingw_winapp.c`
+  (see finding #10) both still run correctly with their actual code
+  pages read-only+executable, verified interactively for the GUI binary
+  (it reaches its blocking `GetMessageA` loop with no fault, meaning
+  `WinMain`, `RegisterClassA`, `CreateWindowExA`, and its GDI paint path
+  all executed correctly from a read-only+exec page) and via `make test`
+  for the console binary.
+
+  AlphaOS's own toolchain (`tools/mkpe.py`) emits a single section
+  flagged *both* execute and write for every app it builds (see that
+  file's header comment) — `harden_sections()` deliberately leaves
+  those alone (grants execute, but doesn't remove write, since the
+  section's own declared characteristics say it's meant to be written,
+  and that's also where its own IAT patching happens). So AlphaOS's own
+  apps (`hello.exe`, `paint.exe`, `winhello.exe`, ...) are unaffected —
+  still RWX, exactly as before this change — while genuine third-party
+  binaries now get real enforcement. Splitting AlphaOS's own build
+  pipeline into separate RX-code / RW-data sections is real future work
+  (see "Known limitations" below), not done here.
+
+This was caught mid-implementation, not shipped broken: the first
+version of `harden_sections()` skipped execute+write sections entirely
+instead of granting them execute, which mapped every AlphaOS-native
+`.exe` non-executable and made `hello.exe`/`winhello.exe`/etc. fault at
+their very first instruction (`page fault ... err=11`, the instruction-
+fetch bit set) — caught immediately by `make test` going from 38/0 to
+27/11, fixed, and reverified before this was considered done.
+
 ## Verification
 
-Beyond `make test` (38 assertions, including the malicious-file checks
+Beyond `make test` (41 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 
@@ -285,17 +359,22 @@ These are real gaps. Fixing them is out of scope for this pass — they'd
 each be a substantial project on their own — but pretending they don't
 exist would be worse than naming them:
 
-- **No W^X / no execute-disable enforcement.** Every mapped page (app
-  image, kernel heap) is Read+Write, and there's no NX bit usage. An app
-  with a memory-corruption bug in its own logic has no additional
-  barrier stopping it from turning that into code execution within its
-  own process (which is then still contained by fault isolation for
-  anything that actually faults — but a successful code-execution
-  primitive that doesn't fault isn't caught by that net).
+- **W^X is now real but partial (see finding #12 above).** The kernel
+  heap and framebuffer are fully non-executable, and a genuine
+  third-party `.exe`'s real code sections (execute-without-write, as a
+  real toolchain emits) are read-only+executable. What's *not* covered:
+  AlphaOS's own toolchain (`tools/mkpe.py`) still emits one RWX section
+  per app, so AlphaOS-native binaries get no W^X benefit at all —
+  fixing that needs `mkpe.py`/`apps/app.ld` to emit separate code/data
+  sections, which is a real toolchain change, not a loader change, and
+  wasn't done here. A stack region also isn't separately tracked or
+  marked non-executable (apps don't have one distinct from the shared
+  kernel stack in this ring-0-for-everything design — see below).
 - **No ASLR.** Every app loads at a fixed, predictable `ImageBase`
-  unless it specifies otherwise. Combined with no W^X, this means a
-  hypothetical exploit chain within a single process has an easier time
-  than it would on a hardened OS.
+  unless it specifies otherwise. Combined with partial W^X, this means
+  a hypothetical exploit chain within a single process (especially one
+  targeting an AlphaOS-native binary, or the shared kernel stack) has
+  an easier time than it would on a hardened OS.
 - **Ring 0 for everything.** Apps run at the same privilege level as the
   kernel (documented as a deliberate lightweight-design tradeoff since
   the very first version of this OS). Containment currently comes
