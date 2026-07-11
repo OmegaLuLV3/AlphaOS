@@ -14,6 +14,7 @@ static void cmd_help(void)
            "  date            read the real-time clock\n"
            "  ping            ping the network gateway (needs a NIC)\n"
            "  nslookup <name> resolve a hostname via DNS (needs a NIC)\n"
+           "  http <host> [path]  fetch a page over plain HTTP\n"
            "  ai <question>   ask the AI assistant (needs ai_bridge.py)\n"
            "  uptime          time since boot\n"
            "  clear           clear the screen\n"
@@ -105,6 +106,39 @@ static void cmd_nslookup(const char *hostname)
         kprintf("nslookup: %s: no answer (timed out or NXDOMAIN)\n", hostname);
 }
 
+static void cmd_http(char *arg)
+{
+    if (!net_ready()) {
+        kprint("http: no NIC (boot with -netdev user,id=net0 "
+               "-device rtl8139,netdev=net0)\n");
+        return;
+    }
+    char *host = arg;
+    char *path = arg;
+    while (*path && *path != ' ')
+        path++;
+    if (*path)
+        *path++ = 0;
+    while (*path == ' ')
+        path++;
+    if (!*host) {
+        kprint("usage: http <host> [path]  (plain HTTP/80 only -- no TLS yet)\n");
+        return;
+    }
+
+    static u8 resp[4096];
+    kprintf("GET http://%s%s ...\n", host, *path ? path : "/");
+    u32 n = net_http_get(host, path, resp, sizeof(resp) - 1);
+    if (!n) {
+        kprint("http: request failed (DNS, connect, or empty response)\n");
+        return;
+    }
+    resp[n] = 0;
+    kprintf("--- %u bytes ---\n", n);
+    kprint((const char *)resp);
+    kprint("\n--- end ---\n");
+}
+
 static void cmd_run(const char *cmdline)
 {
     if (!*cmdline) {
@@ -187,6 +221,8 @@ void shell_run(void)
             cmd_ping();
         else if (strcmp(line, "nslookup") == 0)
             cmd_nslookup(arg);
+        else if (strcmp(line, "http") == 0)
+            cmd_http(arg);
         else if (strcmp(line, "ai") == 0) {
             if (*arg)
                 ai_ask(arg);

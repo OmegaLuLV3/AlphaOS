@@ -133,6 +133,13 @@ bool       net_ready(void);
 bool       net_arp_resolve(const u8 ip[4], u8 mac_out[6]);
 bool       net_ping(const u8 ip[4], u32 *rtt_ms_out);
 bool       net_dns_resolve(const char *hostname, u8 ip_out[4]);
+bool       net_tcp_connect(const u8 ip[4], u16 port, u32 timeout_ms);
+bool       net_tcp_send(const u8 *data, u32 len);
+u32        net_tcp_recv(u8 *buf, u32 max_len, u32 timeout_ms);
+bool       net_tcp_eof(void);
+void       net_tcp_close(void);
+u32        net_http_get(const char *host, const char *path, u8 *out,
+                        u32 out_max);
 const u8  *net_gateway_ip(void);
 const u8  *net_our_ip(void);
 

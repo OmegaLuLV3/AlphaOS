@@ -481,9 +481,98 @@ runner's* actual internet access, which this suite can't assume every
 environment has; a hang or a crash either way would still fail the
 suite. `make test`: 55/55 passing.
 
+### 16. TCP + a minimal HTTP/1.1 client — two real bugs, both caught by
+testing against a genuine external server rather than a synthetic one
+
+**Where:** `kernel/net.c`: the TCP state machine (`tcp_handle()`,
+`net_tcp_connect/send/recv/close()`), and `net_http_get()`.
+
+Client-only, single connection, stop-and-wait (see the file's own
+header comment above `tcp_handle()` for the full list of what this
+deliberately doesn't do yet — no congestion control, no SACK, no
+out-of-order reassembly, no real TIME_WAIT). Built the same way as
+every other protocol in this file: bounds-checked against the real
+received length before any field is read, one static connection
+struct rather than a socket table (AlphaOS only makes one blocking
+network call at a time, the same design `net_ping()`/
+`net_dns_resolve()` already rely on).
+
+**Two real bugs surfaced by testing against an actual external HTTP
+server (`pypi.org`), not a mock — exactly the scenario `ping`'s and
+`nslookup`'s targets never exercised:**
+
+1. **No IP routing — `ip_send()` always ARP-resolved the final
+   destination directly, never the gateway.** `ping` targets the
+   gateway itself; `nslookup` targets the DNS proxy — both happen to
+   already sit on the local SLIRP subnet, so ARP-resolving them
+   directly was indistinguishable from correct routing. The first real
+   `http pypi.org /` request exposed this immediately: a real internet
+   host is *not* on the local subnet, an ARP request for it can never
+   get a reply (nothing on the virtual Ethernet segment owns that
+   address), and the connection just timed out. Fixed by adding
+   `ip_is_local()` (checks whether an address shares our /24) and
+   resolving the *gateway's* MAC as the next hop for anything that
+   isn't local, while the IP header's destination address correctly
+   stays the real, remote target. This is basic, textbook IP routing
+   — its absence wasn't a subtle bug, it was untested code path, found
+   the moment a real remote host was actually the target.
+2. **Acking data that was silently dropped.** The receive path
+   capped how much of an incoming segment it would copy into
+   `tcp.rx_buf` (correctly, to avoid an overflow) but then acked the
+   *entire* segment regardless — including the part it just threw
+   away. A well-behaved TCP sender, having been told "got it, don't
+   resend," never sends those bytes again: permanent, silent data
+   loss, not just reduced throughput. Combined with a second bug —
+   `tcp_send_segment()` advertised a constant window
+   (`sizeof(rx_buf)`) instead of the real current free space — a
+   large response (`pypi.org`'s actual headers, in practice) filled
+   the buffer, silently lost its tail, and the connection reported a
+   truncated response with no error. Both fixed together: the window
+   now reports live free space, and `rcv_nxt` (and therefore every
+   ACK) only ever advances by the number of bytes *actually kept*, so
+   a sender that overruns our window gets nothing acked for the
+   overrun and correctly retransmits once `net_tcp_recv()` drains the
+   buffer and sends a window-update ACK announcing the room again (added
+   specifically to avoid the alternative failure mode — a sender that
+   correctly stops at a zero window and then has no signal telling it
+   the window reopened, i.e. a self-inflicted stall). Caught by manual
+   review immediately after the *first* bug's fix let real data start
+   flowing far enough to hit it — the initial `pypi.org` response came
+   back truncated mid-header at exactly `sizeof(rx_buf)` bytes, which
+   is what led to finding this.
+
+**Known limitations, disclosed rather than fixed in this pass:**
+incoming segments (IP/ICMP/UDP/TCP alike) aren't checksum-verified —
+only ever computed when *sending*. This is a data-integrity gap, not
+really a security one: an adversary capable of injecting packets on
+the path can trivially compute a correct checksum too, since it's not
+a cryptographic MAC. More relevant from a security angle: `tcp_handle()`
+accepts a `RST` from anything matching the connection's IP/port tuple
+without validating its sequence number falls in the current receive
+window — real TCP stacks require this specifically to raise the bar
+against off-path RST injection. The initial sequence number
+(`net_tcp_connect()`'s `snd_nxt`) is derived from `uptime_ms()`, not a
+real random source — adequate against the trusted, directly-connected
+SLIRP backend this targets, not against a hostile network path. None
+of these matter yet because nothing this codebase does today puts
+AlphaOS on an untrusted network path (see the Roadmap in README.md) —
+but "not yet exposed to that threat model" is a fact about deployment,
+not a property of the code, so they're listed here rather than assumed
+away.
+
+**Verification:** `http pypi.org /` — real DNS resolution, a real TCP
+three-way handshake, a real HTTP/1.1 request, and a complete, correct,
+un-truncated real response (`HTTP/1.1 301 Moved Permanently` plus the
+full header block, ending exactly where the real response ends) from
+PyPI's actual production server, cross-checked byte-for-byte against a
+raw Python socket making the identical request from the host. `make
+test`'s automated check accepts either a real response or the client's
+own clean failure message, same reasoning as `nslookup`'s check above.
+`make test`: 56/56 passing.
+
 ## Verification
 
-Beyond `make test` (55 assertions, including the malicious-file checks
+Beyond `make test` (56 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 
@@ -601,23 +690,32 @@ exist would be worse than naming them:
   files, not a mechanical sweep of every function in the kernel. Treat
   "audited" as "this specific surface was looked at carefully," not
   "this OS is safe against a motivated attacker."
-- **The network stack (findings #14/#15) is intentionally minimal, not
-  hardened.** No TCP (so no port scanning/connection-flood surface
-  exists yet, but also nothing useful can be built on top of it beyond
-  ping/DNS), no fragmentation reassembly, no TLS. DNS answers aren't
-  validated against the question beyond the transaction ID matching
-  and the QR bit being set — no 0x20 encoding, no strict source-port
-  randomization beyond the fixed `DNS_LOCAL_PORT`, which is fine
-  against a directly-connected, trusted SLIRP proxy but would not be
-  fine against an untrusted network path once this talks to a real
+- **The network stack (findings #14/#15/#16) is intentionally minimal,
+  not hardened.** TCP now exists (client-only, single connection, no
+  congestion control/SACK/out-of-order reassembly), and a minimal
+  HTTP/1.1 GET client on top of it — but still no TLS, so nothing this
+  can reach is actually confidential or tamper-evident in transit; an
+  on-path attacker can read or rewrite every byte `http` sends or
+  receives. No incoming checksum verification anywhere in the stack
+  (IP/ICMP/UDP/TCP), no TCP RST sequence-number validation (so RST
+  injection from anything that can reach the connection's IP/port
+  tuple isn't defended against), and TCP's initial sequence number is
+  derived from `uptime_ms()`, not a real random source — see finding
+  #16 for the full reasoning on why none of this matters *yet*
+  (nothing here is exposed to an untrusted network path today) without
+  it being an excuse to skip fixing before it would matter. DNS
+  answers aren't validated against the question beyond the transaction
+  ID matching and the QR bit being set — no 0x20 encoding, no strict
+  source-port randomization beyond the fixed `DNS_LOCAL_PORT`, which is
+  fine against a directly-connected, trusted SLIRP proxy but would not
+  be fine against an untrusted network path once this talks to a real
   DNS server over a real link. The IP configuration is a single
   hardcoded static address matching QEMU's SLIRP defaults — there's no
   DHCP client, so this driver only makes sense against the exact
-  backend the Makefile configures. Every connection this eventually
-  needs (an HTTP client, an auto-updater pulling from GitHub) requires
-  a real TCP layer and TLS that don't exist yet; building those
-  without inheriting classic C network-stack vulnerability classes
-  (TCP state-machine bugs, integer overflows in reassembly,
-  certificate-validation bypasses in a home-grown TLS implementation)
-  will need the same care this pass put into findings #14/#15, not
-  less.
+  backend the Makefile configures. An auto-updater pulling from GitHub
+  still needs TLS (GitHub requires HTTPS) plus a disk driver and
+  writable filesystem (see README's roadmap) before it's possible at
+  all; building TLS without inheriting classic vulnerability classes
+  (certificate-validation bypasses in a home-grown implementation
+  chief among them) will need the same care this pass put into
+  findings #14/#15/#16, not less.

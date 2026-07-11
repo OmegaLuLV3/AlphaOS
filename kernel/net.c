@@ -74,11 +74,18 @@ static const u8 gateway_ip[4]  = { 10, 0, 2, 2 };
 static const u8 dns_server_ip[4] = { 10, 0, 2, 3 }; /* SLIRP's DNS proxy */
 static const u8 bcast_mac[6]   = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
 
-/* ---- byte-order helpers: only 16-bit protocol fields need swapping
-   (IP addresses are handled as raw 4-byte arrays throughout, already
-   in wire order, so they never need htonl/ntohl) ------------------- */
+/* ---- byte-order helpers: IP addresses are handled as raw 4-byte
+   arrays throughout, already in wire order, so only the protocol
+   fields that are genuine multi-byte integers (ports, TCP sequence/
+   ack numbers, ...) need swapping ------------------------------------ */
 static u16 htons(u16 v) { return (u16)((v >> 8) | (v << 8)); }
 #define ntohs htons /* swap is its own inverse */
+static u32 htonl(u32 v)
+{
+    return ((v & 0xFFu) << 24) | ((v & 0xFF00u) << 8) |
+           ((v & 0xFF0000u) >> 8) | ((v >> 24) & 0xFFu);
+}
+#define ntohl htonl
 
 /* ---- tiny ARP cache (IP -> MAC), and one outstanding-ping slot ------ */
 #define ARP_CACHE_SIZE 4
@@ -237,20 +244,37 @@ bool net_arp_resolve(const u8 ip[4], u8 mac_out[6])
 #define IP_HDR_LEN   20
 #define IP_PROTO_ICMP 1
 #define IP_PROTO_UDP  17
+#define IP_PROTO_TCP  6
 #define ICMP_ECHO_REQUEST 8
 #define ICMP_ECHO_REPLY   0
-#define IP_PAYLOAD_MAX 512 /* plenty for ICMP echo and DNS queries/replies */
+/* must cover the largest thing ip_send() is ever asked to carry: a
+   full TCP segment is TCP_HDR_LEN(20) + TCP_MSS(1024) = 1044 bytes
+   (see the TCP section below) -- ICMP echo and DNS need far less */
+#define IP_PAYLOAD_MAX 1044
+
+/* Is ip on our local (SLIRP) /24 subnet? If so, its own MAC can be
+   ARP-resolved directly; if not, it's only reachable via the gateway,
+   and the *gateway's* MAC is the right next hop for the Ethernet
+   frame even though the IP header's destination stays the real,
+   remote address -- basic IP routing, not something ping/nslookup's
+   targets ever needed to exercise (the gateway and the DNS proxy both
+   happen to already be on the local subnet themselves). */
+static bool ip_is_local(const u8 ip[4])
+{
+    return ip[0] == our_ip[0] && ip[1] == our_ip[1] && ip[2] == our_ip[2];
+}
 
 /* Builds and sends an IPv4 header + the given already-built payload
-   (ICMP or UDP, whichever proto says) to dst_ip, resolving the
-   next-hop MAC via ARP first. Shared by icmp_send() and udp_send() so
-   the IP header construction/checksum logic exists in exactly one
-   place. */
+   (ICMP, UDP, or TCP, whichever proto says) to dst_ip, resolving the
+   right next-hop MAC via ARP first (see ip_is_local() above). Shared
+   by icmp_send()/udp_send()/tcp_send_segment() so the IP header
+   construction/checksum/routing logic exists in exactly one place. */
 static void ip_send(const u8 dst_ip[4], u8 proto, const u8 *payload,
                     u32 payload_len)
 {
+    const u8 *next_hop_ip = ip_is_local(dst_ip) ? dst_ip : gateway_ip;
     u8 mac[6];
-    if (!net_arp_resolve(dst_ip, mac))
+    if (!net_arp_resolve(next_hop_ip, mac))
         return;
     if (payload_len > IP_PAYLOAD_MAX)
         return;
@@ -393,6 +417,313 @@ static bool udp_request(const u8 dst_ip[4], u16 dst_port, u16 src_port,
     return false;
 }
 
+/* ---- TCP -----------------------------------------------------------------
+ *
+ * Client-only, single connection, stop-and-wait: AlphaOS only ever
+ * makes one blocking network call at a time (same design as
+ * net_ping()/net_dns_resolve() above), so this is one static
+ * connection struct and one segment in flight at a time -- never a
+ * real socket table, never a real send/receive window. No listening
+ * side, no congestion control, no SACK, no out-of-order segment
+ * reassembly (an out-of-order segment is simply dropped, relying on
+ * the peer's own retransmission -- fine against a real TCP stack on
+ * the other end, since retransmitting unacked data is exactly what
+ * real TCP does anyway). Each of these is a real, documented
+ * simplification for this first slice, not an oversight -- see
+ * SECURITY.md.
+ */
+#define TCP_HDR_LEN 20
+#define TCP_MSS     1024 /* comfortably under the RTL8139 TX buffer size */
+
+#define TCP_FLAG_FIN 0x01
+#define TCP_FLAG_SYN 0x02
+#define TCP_FLAG_RST 0x04
+#define TCP_FLAG_PSH 0x08
+#define TCP_FLAG_ACK 0x10
+
+typedef enum {
+    TCP_CLOSED, TCP_SYN_SENT, TCP_ESTABLISHED,
+    TCP_FIN_WAIT_1, TCP_FIN_WAIT_2, TCP_CLOSE_WAIT, TCP_LAST_ACK,
+} tcp_state_t;
+
+typedef struct {
+    volatile tcp_state_t state;
+    u8   remote_ip[4];
+    u16  local_port, remote_port;
+    u32  snd_nxt; /* sequence number of the next byte/flag we'll send */
+    u32  snd_una; /* oldest byte we've sent that isn't acked yet */
+    u32  rcv_nxt; /* next sequence number we expect from the peer */
+    volatile bool ack_seen; /* our last outstanding segment got acked */
+    volatile bool fin_seen; /* peer has sent FIN */
+    volatile bool rst_seen; /* peer has sent RST */
+    u8            rx_buf[4096];
+    volatile u32  rx_len;
+} tcp_conn_t;
+
+static tcp_conn_t tcp;
+
+/* pseudo-header (RFC 793 checksum) + segment, in one temporary buffer
+   so the existing checksum16() can run over the whole thing; only the
+   segment part (offset 12 onward) is ever actually transmitted */
+static u16 tcp_checksum(const u8 dst_ip[4], const u8 *seg, u32 seg_len)
+{
+    u8 buf[12 + TCP_HDR_LEN + TCP_MSS];
+    if (seg_len > sizeof(buf) - 12)
+        return 0; /* callers keep segments within TCP_MSS; this can't
+                      actually happen, but never scribble past buf if
+                      that invariant is ever violated by a future bug */
+    memcpy(buf, our_ip, 4);
+    memcpy(buf + 4, dst_ip, 4);
+    buf[8] = 0;
+    buf[9] = IP_PROTO_TCP;
+    *(u16 *)(buf + 10) = htons((u16)seg_len);
+    memcpy(buf + 12, seg, seg_len);
+    return checksum16(buf, 12 + seg_len);
+}
+
+static void tcp_send_segment(u8 flags, u32 seq, u32 ack, const u8 *data,
+                             u32 data_len)
+{
+    if (data_len > TCP_MSS)
+        data_len = TCP_MSS;
+    u8 seg[TCP_HDR_LEN + TCP_MSS];
+    *(u16 *)(seg + 0) = htons(tcp.local_port);
+    *(u16 *)(seg + 2) = htons(tcp.remote_port);
+    *(u32 *)(seg + 4) = htonl(seq);
+    *(u32 *)(seg + 8) = htonl(ack);
+    seg[12] = (TCP_HDR_LEN / 4) << 4; /* data offset, no options */
+    seg[13] = flags;
+    /* advertised window: the REAL current free room in rx_buf, not a
+       constant -- see the "only ack what we actually kept" comment in
+       tcp_handle() below for why this has to be honest, not just a
+       nice-to-have */
+    *(u16 *)(seg + 14) = htons((u16)(sizeof(tcp.rx_buf) - tcp.rx_len));
+    *(u16 *)(seg + 16) = 0; /* checksum, filled below */
+    *(u16 *)(seg + 18) = 0; /* urgent pointer: unused */
+    if (data_len)
+        memcpy(seg + TCP_HDR_LEN, data, data_len);
+    u32 seg_len = TCP_HDR_LEN + data_len;
+    *(u16 *)(seg + 16) = htons(tcp_checksum(tcp.remote_ip, seg, seg_len));
+
+    ip_send(tcp.remote_ip, IP_PROTO_TCP, seg, seg_len);
+}
+
+static void tcp_handle(const u8 src_ip[4], const u8 *pkt, u32 len)
+{
+    if (len < TCP_HDR_LEN || tcp.state == TCP_CLOSED)
+        return;
+    u16 src_port = ntohs(*(const u16 *)(pkt + 0));
+    u16 dst_port = ntohs(*(const u16 *)(pkt + 2));
+    u32 seq = ntohl(*(const u32 *)(pkt + 4));
+    u32 ack = ntohl(*(const u32 *)(pkt + 8));
+    u8  doff = (pkt[12] >> 4) * 4;
+    u8  flags = pkt[13];
+    if (doff < TCP_HDR_LEN || len < doff)
+        return;
+    u32 data_len = len - doff;
+    const u8 *data = pkt + doff;
+
+    /* one connection at a time: anything not addressed to it is noise */
+    if (memcmp(src_ip, tcp.remote_ip, 4) != 0 || src_port != tcp.remote_port ||
+        dst_port != tcp.local_port)
+        return;
+
+    if (flags & TCP_FLAG_RST) {
+        tcp.rst_seen = true;
+        tcp.state = TCP_CLOSED;
+        return;
+    }
+
+    if (tcp.state == TCP_SYN_SENT) {
+        if ((flags & TCP_FLAG_SYN) && (flags & TCP_FLAG_ACK) &&
+            ack == tcp.snd_nxt) {
+            tcp.rcv_nxt = seq + 1; /* SYN consumes one sequence number */
+            tcp.snd_una = ack;
+            tcp.state = TCP_ESTABLISHED;
+            tcp.ack_seen = true;
+        }
+        return;
+    }
+
+    /* stop-and-wait: we only ever have one unacked segment outstanding,
+       so "acked up to snd_nxt" is unambiguous -- no partial-window
+       bookkeeping needed */
+    if ((flags & TCP_FLAG_ACK) && ack == tcp.snd_nxt && !tcp.ack_seen) {
+        tcp.snd_una = tcp.snd_nxt;
+        tcp.ack_seen = true;
+        if (tcp.state == TCP_FIN_WAIT_1)
+            tcp.state = TCP_FIN_WAIT_2;
+        else if (tcp.state == TCP_LAST_ACK)
+            tcp.state = TCP_CLOSED;
+    }
+
+    if (seq == tcp.rcv_nxt &&
+        (tcp.state == TCP_ESTABLISHED || tcp.state == TCP_FIN_WAIT_1 ||
+         tcp.state == TCP_FIN_WAIT_2)) {
+        /* Only ever advance rcv_nxt -- and therefore only ever ACK --
+           by exactly how many bytes we actually kept. Acking data we
+           silently dropped because rx_buf was full would tell the
+           sender "got it, never send that again," permanently losing
+           those bytes instead of letting the sender's own
+           retransmission recover them once we've drained room (see
+           tcp_send_segment()'s window, which now reports real free
+           space instead of a constant -- this and that fix have to
+           go together, or a full receive buffer is a silent data-loss
+           bug, not just reduced throughput). */
+        u32 room = sizeof(tcp.rx_buf) - tcp.rx_len;
+        u32 accepted = data_len < room ? data_len : room;
+        if (accepted) {
+            memcpy(tcp.rx_buf + tcp.rx_len, data, accepted);
+            tcp.rx_len += accepted;
+        }
+        tcp.rcv_nxt = seq + accepted;
+
+        /* the FIN's sequence number sits right after this segment's
+           data, so it can only be consumed once every byte before it
+           has actually been accepted -- accepting a FIN out of order
+           relative to unbuffered data would let the connection close
+           while bytes are still missing */
+        bool got_all_data = (accepted == data_len);
+        bool got_fin = (flags & TCP_FLAG_FIN) && got_all_data && !tcp.fin_seen;
+        if (got_fin) {
+            tcp.rcv_nxt += 1;
+            tcp.fin_seen = true;
+            tcp.state = (tcp.state == TCP_ESTABLISHED) ? TCP_CLOSE_WAIT
+                                                        : TCP_CLOSED;
+        }
+
+        if (accepted || got_fin)
+            tcp_send_segment(TCP_FLAG_ACK, tcp.snd_nxt, tcp.rcv_nxt, NULL, 0);
+    }
+}
+
+bool net_tcp_connect(const u8 ip[4], u16 port, u32 timeout_ms)
+{
+    if (!nic_present)
+        return false;
+
+    memset(&tcp, 0, sizeof(tcp));
+    memcpy(tcp.remote_ip, ip, 4);
+    tcp.remote_port = port;
+    static u16 port_counter = 40000;
+    tcp.local_port = port_counter++;
+    if (port_counter < 40000)
+        port_counter = 40000; /* wrapped past 65535: stay in the range */
+    tcp.snd_nxt = uptime_ms() * 1000u + 1; /* not a cryptographic ISN --
+                                               see SECURITY.md */
+    tcp.snd_una = tcp.snd_nxt;
+    tcp.state = TCP_SYN_SENT;
+
+    tcp_send_segment(TCP_FLAG_SYN, tcp.snd_nxt, 0, NULL, 0);
+    tcp.snd_nxt++;
+
+    u32 start = uptime_ms();
+    while (uptime_ms() - start < timeout_ms) {
+        if (tcp.state == TCP_ESTABLISHED) {
+            tcp_send_segment(TCP_FLAG_ACK, tcp.snd_nxt, tcp.rcv_nxt, NULL, 0);
+            return true;
+        }
+        if (tcp.rst_seen)
+            return false;
+    }
+    tcp.state = TCP_CLOSED;
+    return false;
+}
+
+bool net_tcp_send(const u8 *data, u32 len)
+{
+    if (tcp.state != TCP_ESTABLISHED && tcp.state != TCP_CLOSE_WAIT)
+        return false;
+
+    u32 sent = 0;
+    while (sent < len) {
+        u32 chunk = len - sent;
+        if (chunk > TCP_MSS)
+            chunk = TCP_MSS;
+        u32 seq = tcp.snd_nxt;
+        tcp.snd_nxt = seq + chunk;
+
+        for (int attempt = 0; attempt < 4; attempt++) {
+            tcp.ack_seen = false;
+            tcp_send_segment(TCP_FLAG_PSH | TCP_FLAG_ACK, seq, tcp.rcv_nxt,
+                             data + sent, chunk);
+            u32 start = uptime_ms();
+            bool acked = false;
+            while (uptime_ms() - start < 1000) {
+                if (tcp.ack_seen) {
+                    acked = true;
+                    break;
+                }
+                if (tcp.rst_seen || tcp.state == TCP_CLOSED)
+                    return false;
+            }
+            if (acked)
+                break;
+            if (attempt == 3)
+                return false; /* no retransmission timer beyond this:
+                                  give up rather than spin forever */
+        }
+        sent += chunk;
+    }
+    return true;
+}
+
+u32 net_tcp_recv(u8 *buf, u32 max_len, u32 timeout_ms)
+{
+    u32 start = uptime_ms();
+    while (uptime_ms() - start < timeout_ms) {
+        if (tcp.rx_len > 0) {
+            u32 n = tcp.rx_len < max_len ? tcp.rx_len : max_len;
+            memcpy(buf, tcp.rx_buf, n);
+            u32 remaining = tcp.rx_len - n;
+            if (remaining)
+                memmove(tcp.rx_buf, tcp.rx_buf + n, remaining);
+            tcp.rx_len = remaining;
+            /* window update: draining rx_buf just freed real room,
+               and the peer has no way to know that unless told --
+               an ACK re-announces the (now larger) window
+               tcp_send_segment() computes live from tcp.rx_len.
+               Without this, a sender that had filled our window to
+               zero has no reason to send more: it's correctly
+               waiting on room it still believes doesn't exist. */
+            if (tcp.state == TCP_ESTABLISHED || tcp.state == TCP_FIN_WAIT_1 ||
+                tcp.state == TCP_FIN_WAIT_2)
+                tcp_send_segment(TCP_FLAG_ACK, tcp.snd_nxt, tcp.rcv_nxt, NULL,
+                                 0);
+            return n;
+        }
+        if (tcp.fin_seen || tcp.rst_seen || tcp.state == TCP_CLOSED)
+            return 0;
+    }
+    return 0;
+}
+
+bool net_tcp_eof(void)
+{
+    return tcp.fin_seen || tcp.rst_seen || tcp.state == TCP_CLOSED;
+}
+
+void net_tcp_close(void)
+{
+    if (tcp.state == TCP_ESTABLISHED || tcp.state == TCP_CLOSE_WAIT) {
+        u32 seq = tcp.snd_nxt;
+        tcp.snd_nxt = seq + 1;
+        tcp.ack_seen = false;
+        tcp_send_segment(TCP_FLAG_FIN | TCP_FLAG_ACK, seq, tcp.rcv_nxt, NULL,
+                         0);
+        tcp.state =
+            (tcp.state == TCP_ESTABLISHED) ? TCP_FIN_WAIT_1 : TCP_LAST_ACK;
+
+        u32 start = uptime_ms();
+        while (uptime_ms() - start < 2000 && tcp.state != TCP_CLOSED)
+            ;
+    }
+    tcp.state = TCP_CLOSED; /* whether or not the peer's side of the
+                                handshake ever finished, this end is
+                                done with the connection either way --
+                                no real TIME_WAIT is implemented */
+}
+
 static void ip_handle(const u8 *pkt, u32 len)
 {
     if (len < IP_HDR_LEN)
@@ -421,6 +752,8 @@ static void ip_handle(const u8 *pkt, u32 len)
         icmp_handle(src_ip, pkt + ihl, total_len - ihl);
     else if (proto == IP_PROTO_UDP)
         udp_handle(pkt + ihl, total_len - ihl);
+    else if (proto == IP_PROTO_TCP)
+        tcp_handle(src_ip, pkt + ihl, total_len - ihl);
 }
 
 /* ---- Ethernet dispatch + RX/IRQ ---------------------------------------- */
@@ -600,6 +933,57 @@ bool net_dns_resolve(const char *hostname, u8 ip_out[4])
         offset += rdlength;
     }
     return false; /* no A record in the answer section */
+}
+
+/* ---- minimal HTTP/1.1 GET client (needs DNS + TCP above) --------------- */
+
+static u32 str_append(char *dst, u32 dst_max, const char *src)
+{
+    u32 n = 0;
+    while (src[n] && n + 1 < dst_max) {
+        dst[n] = src[n];
+        n++;
+    }
+    return n;
+}
+
+/* Resolves `host` via DNS, connects to it on port 80, sends a minimal
+   HTTP/1.1 GET for `path`, and copies whatever bytes come back
+   (status line, headers, and body, entirely unparsed -- this is
+   deliberately not an HTTP client in any fuller sense) into `out`.
+   Returns the number of bytes written, 0 on DNS/connect failure or an
+   empty response. Always closes the connection before returning. */
+u32 net_http_get(const char *host, const char *path, u8 *out, u32 out_max)
+{
+    if (!nic_present)
+        return 0;
+
+    u8 ip[4];
+    if (!net_dns_resolve(host, ip))
+        return 0;
+    if (!net_tcp_connect(ip, 80, 3000))
+        return 0;
+
+    char req[512];
+    u32 pos = 0;
+    pos += str_append(req + pos, sizeof(req) - pos, "GET ");
+    pos += str_append(req + pos, sizeof(req) - pos, *path ? path : "/");
+    pos += str_append(req + pos, sizeof(req) - pos, " HTTP/1.1\r\nHost: ");
+    pos += str_append(req + pos, sizeof(req) - pos, host);
+    pos += str_append(req + pos, sizeof(req) - pos,
+                      "\r\nConnection: close\r\nUser-Agent: AlphaOS\r\n\r\n");
+
+    u32 total = 0;
+    if (net_tcp_send((const u8 *)req, pos)) {
+        while (total < out_max && !net_tcp_eof()) {
+            u32 n = net_tcp_recv(out + total, out_max - total, 3000);
+            if (!n)
+                break;
+            total += n;
+        }
+    }
+    net_tcp_close();
+    return total;
 }
 
 /* ---- public API --------------------------------------------------------- */

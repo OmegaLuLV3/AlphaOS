@@ -38,6 +38,12 @@ feed() {
     # environment running it has outbound DNS.
     printf 'nslookup example.com\n'
     sleep 3
+    # same "test runner's real internet access" caveat as nslookup
+    # above, plus TCP specifically -- pypi.org is used here (rather
+    # than example.com) only because it's a stable, well-known plain-
+    # HTTP-reachable host; nothing pypi-specific is asserted below.
+    printf 'http pypi.org /\n'
+    sleep 6
     if [ "$HAVE_MINGW" = 1 ]; then
         printf 'run mingw_hello.exe\n'
         sleep 1.5
@@ -77,7 +83,7 @@ check() {
     fi
 }
 
-check "AlphaOS 0.10"
+check "AlphaOS 0.11"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
@@ -137,6 +143,12 @@ check "reply from 10.0.2.2: time="
 # message -- see the feed() comment above on why this can't require
 # an actual answer unconditionally
 check "example.com -> [0-9]\|nslookup: example.com: no answer"
+# http: real TCP handshake + HTTP/1.1 request/response, or the clean
+# failure path -- same reasoning as nslookup above. A hang or crash
+# either way would still fail the suite (the shell must reach the next
+# prompt for later checks -- "not found"/"still alive" below -- to run
+# at all).
+check "bytes ---\|http: request failed"
 if [ "$HAVE_MINGW" = 1 ]; then
     check "hello from a REAL mingw-w64 compiled Windows binary"
     check "mingw_hello.exe exited with code 0"         # genuine 3rd-party .exe ran

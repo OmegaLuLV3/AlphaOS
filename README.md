@@ -8,7 +8,7 @@ with a Windows-7-inspired graphical desktop and a real driver layer,
 while staying tiny and careful about resources.
 
 ```
-  AlphaOS 0.10 -- a lightweight OS that runs .exe files
+  AlphaOS 0.11 -- a lightweight OS that runs .exe files
   130944 KiB RAM managed | 17996 KiB in use | 9 file(s) on ramdisk
   display: 1024x768x32 desktop | 6 PCI device(s)
 
@@ -139,30 +139,36 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   | `pit.c` | 8254 timer (IRQ 0) | 100 Hz tick, sleep, uptime |
   | `serial.c` | 16550 UART | full headless console + logs |
   | `font.c` | VGA | captures the BIOS 8×16 font for the GUI |
-  | `net.c` | Realtek RTL8139 NIC | Ethernet/ARP/IPv4/ICMP/UDP/DNS, `ping`/`nslookup` |
+  | `net.c` | Realtek RTL8139 NIC | full stack through TCP/HTTP: `ping`/`nslookup`/`http` |
 
   Balanced by design: if the display adapter is missing (e.g. unusual
   real hardware), the OS degrades gracefully to the VGA text-mode shell —
   every feature except windows still works. Same for the NIC: no RTL8139
   present, no network — everything else keeps working.
-- **A real network stack, growing** — `net.c` drives an RTL8139 NIC
-  directly (PCI enable, ring-buffer RX/TX, IRQ-driven receive) and
-  implements Ethernet/ARP/IPv4/ICMP/UDP plus a minimal DNS resolver:
-  `ping` at the shell resolves the gateway's MAC over ARP, sends an
-  ICMP echo request, and reports the round trip; `nslookup <name>`
-  sends a real DNS query over UDP and parses a real response —
-  genuinely over emulated hardware (QEMU's SLIRP backend) all the way
-  out to a real upstream DNS resolver, not a loopback shortcut or a
-  mock. This is the foundation step for two much bigger asks (a
-  browser, pulling updates from GitHub): both need a real network
-  stack under them before anything else is possible, so that's what
-  got built first. No TCP/TLS yet — see the roadmap below. Every byte
-  this parses comes off the wire untrusted, and it's threat-modeled
-  that way from the start; see `SECURITY.md` findings #14 and #15,
-  including two bugs (an integer underflow in malformed IP-packet
-  handling, and — for DNS — a whole bug *class*, compression-pointer
-  loops, sidestepped by construction rather than patched after the
-  fact) caught and fixed by adversarial review before this shipped.
+- **A real network stack, through TCP and HTTP** — `net.c` drives an
+  RTL8139 NIC directly (PCI enable, ring-buffer RX/TX, IRQ-driven
+  receive) and implements Ethernet/ARP/IPv4/ICMP/UDP/TCP, a minimal
+  DNS resolver, and a minimal HTTP/1.1 GET client on top: `ping`
+  resolves the gateway over ARP and reports an ICMP round trip;
+  `nslookup <name>` resolves a real hostname over a real DNS query;
+  `http <host> [path]` does a real DNS lookup, a real TCP three-way
+  handshake, and returns a real HTTP response — verified against
+  PyPI's actual production server, byte-for-byte identical to what a
+  raw socket on the host gets back for the same request, not a mock or
+  a loopback shortcut. Basic IP routing (traffic to a non-local address
+  goes via the gateway's MAC, not a direct — and doomed — ARP for the
+  real destination) and real flow control (the receive window reflects
+  actual free buffer space, and data is only ever acknowledged once
+  it's actually been kept) both exist because the *first* real
+  external request this made exposed their absence — `ping`'s and
+  `nslookup`'s targets never needed either, so nothing forced the bugs
+  to surface until a request left the local virtual subnet for real.
+  This is the foundation two much bigger asks (a browser, pulling
+  updates from GitHub) need under them; still no TLS — see the roadmap
+  below. Every byte this parses comes off the wire untrusted, and it's
+  threat-modeled that way from the start; see `SECURITY.md` findings
+  #14, #15, and #16 for the full history, including every bug found
+  and fixed along the way.
 - **Lightweight** — kernel ~5.3k lines of C/asm; the whole system boots
   to a composited desktop in well under a second.
 - **Resource management**
@@ -224,7 +230,7 @@ for AlphaOS itself.
 make          # build kernel, .exe apps, and a bootable GRUB ISO
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (55 assertions)
+make test     # scripted end-to-end boot test (56 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -253,6 +259,8 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `lspci` | list devices found by the PCI driver |
 | `date` | read the real-time clock |
 | `ping` | ARP-resolve + ICMP-ping the network gateway (needs a NIC) |
+| `nslookup <name>` | resolve a hostname via a real DNS query (needs a NIC) |
+| `http <host> [path]` | fetch a page over plain HTTP/1.1 (needs a NIC; no TLS yet) |
 | `uptime`, `echo`, `clear`, `help`, `halt` | the usual |
 
 ## Bundled programs
@@ -342,40 +350,44 @@ JIT, and the full modern web platform; a GitHub-pulling updater needs
 somewhere persistent to write the update to). Both share the same hard
 prerequisite, so that's what's being built first:
 
-1. **Network stack foundation** — in progress: `net.c`'s RTL8139 driver
-   + Ethernet/ARP/IPv4/ICMP/UDP (`ping`) and a minimal DNS resolver
-   (`nslookup`) are done. Still needed: TCP.
-2. **A minimal HTTP client** — not started; needs TCP from step 1
-   first. (DNS, the other half of this step, is already done above.)
-3. **TLS** — not started; almost everything on the modern web requires
-   HTTPS, including GitHub's API and release downloads.
-4. **A disk driver + a real writable filesystem** — not started;
+1. **Network stack foundation** — done: `net.c`'s RTL8139 driver +
+   Ethernet/ARP/IPv4/ICMP/UDP/TCP (`ping`), a minimal DNS resolver
+   (`nslookup`), and a minimal HTTP/1.1 client (`http`).
+2. **TLS** — not started; almost everything on the modern web requires
+   HTTPS, including GitHub's API and release downloads. `http` today
+   is plain-HTTP only, which the shell's own `usage` text says
+   outright rather than leaving implicit.
+3. **A disk driver + a real writable filesystem** — not started;
    storage today is a read-only ramdisk rebuilt at compile time, so
    there's nowhere to persist a downloaded update (or a browser cache)
    yet. Required for the updater specifically, not for a browser.
-5. **Update verification + apply** — not started; whatever eventually
+4. **Update verification + apply** — not started; whatever eventually
    downloads a new build must be cryptographically verified before
    it's trusted with anything, the same care this project's whole
    security model is built around (see `SECURITY.md`).
-6. **A minimal HTML/CSS parser + text-mode renderer** — not started;
+5. **A minimal HTML/CSS parser + text-mode renderer** — not started;
    this is the realistic ceiling for "a browser" here — never Firefox.
 
 Each step gets the same treatment as everything else in this repo:
 built against real protocols/formats, tested against real traffic (not
 mocked), and reviewed adversarially before being called done — see
-`SECURITY.md` findings #14 and #15 for how that played out for step 1
-so far (including a bounds bug and an entire bug *class* — DNS
-compression-pointer loops — each caught before shipping).
+`SECURITY.md` findings #14, #15, and #16 for how that played out for
+step 1 (a bounds bug, an entire bug *class* — DNS compression-pointer
+loops — sidestepped by construction, and two bugs in the TCP/HTTP work
+that only surfaced once a request actually left the local virtual
+network: no IP routing to a remote gateway, and data getting
+acknowledged after being silently dropped by a full receive buffer).
 
 ## Layout
 
 ```
 kernel/   boot.S (long-mode transition), GDT/IDT (64-bit), drivers
           (pci, bga, mouse, kbd, rtc, serial, font, net — RTL8139 +
-          Ethernet/ARP/IPv4/ICMP), pmm, paging (4-level), kheap,
-          ramdisk, PE32+ loader + import resolver, Win32/msvcrt API
-          (win32.c, ms_abi), ai.c (AI channel), AlphaOS API, gfx
-          primitives, window manager/compositor, terminal, shell
+          Ethernet/ARP/IPv4/ICMP/UDP/TCP + DNS + HTTP client), pmm,
+          paging (4-level), kheap, ramdisk, PE32+ loader + import
+          resolver, Win32/msvcrt API (win32.c, ms_abi), ai.c (AI
+          channel), AlphaOS API, gfx primitives, window
+          manager/compositor, terminal, shell
 apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
           Windows-style runtime (win32.h, wincrt0.S, imports.list)
 compat/   mingw_hello.c, mingw_winapp.c, mingw_readfile.c — built by a
