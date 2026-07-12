@@ -187,6 +187,30 @@ bool crypto_selftest(void);
 extern bool crypto_ok; /* set once at boot; TLS code must check this
                            and refuse to run if the self-test failed */
 
+/* ---- x509.c: ASN.1 DER parser + X.509 certificate parsing ------------ */
+#define X509_MAX_SAN 8
+
+typedef struct { u16 year; u8 month, day, hour, minute, second; } x509_time_t;
+
+typedef struct {
+    const u8 *tbs_start; u32 tbs_len;       /* raw TBSCertificate DER (what's hashed+signed) */
+    const u8 *issuer_start; u32 issuer_len; /* raw issuer Name DER (chain matching) */
+    const u8 *subject_start; u32 subject_len;
+    const u8 *sig_start; u32 sig_len;       /* raw signature bytes */
+    bool sig_alg_is_sha256_rsa;
+    bignum_t rsa_n;
+    bignum_t rsa_e;
+    bool has_rsa_key;
+    x509_time_t not_before, not_after;
+    struct { const u8 *ptr; u32 len; } san_dns[X509_MAX_SAN];
+    u32 san_dns_count;
+    bool is_ca;
+} x509_cert_t;
+
+bool x509_parse_certificate(const u8 *der, u32 der_len, x509_cert_t *out);
+bool x509_hostname_matches(const x509_cert_t *cert, const char *hostname);
+bool x509_selftest(void);
+
 /* ---- net.c: RTL8139 driver + Ethernet/ARP/IPv4/ICMP ------------------ */
 void       net_init(void);
 bool       net_ready(void);

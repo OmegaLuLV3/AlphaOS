@@ -64,6 +64,11 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     crypto_ok = crypto_selftest();
     kprintf("crypto: self-test %s\n", crypto_ok ? "passed" : "FAILED");
 
+    /* Same fail-closed discipline as the crypto self-test above, for
+       the ASN.1/X.509 layer TLS certificate validation depends on. */
+    bool x509_ok = x509_selftest();
+    kprintf("x509: self-test %s\n", x509_ok ? "passed" : "FAILED");
+
     /* driver bring-up */
     font_init();  /* capture the VGA font while still in text mode */
     pci_scan();
