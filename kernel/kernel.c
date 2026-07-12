@@ -72,6 +72,9 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     bool roots_ok = x509_roots_selftest();
     kprintf("x509: trusted-root self-test %s\n", roots_ok ? "passed" : "FAILED");
 
+    bool tls_ok = tls_selftest();
+    kprintf("tls: self-test %s\n", tls_ok ? "passed" : "FAILED");
+
     /* driver bring-up */
     font_init();  /* capture the VGA font while still in text mode */
     pci_scan();

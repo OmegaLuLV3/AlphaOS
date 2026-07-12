@@ -215,6 +215,14 @@ bool x509_selftest(void);
 bool x509_find_trusted_root(const u8 *issuer_der, u32 issuer_len, x509_cert_t *out);
 bool x509_roots_selftest(void);
 
+/* ---- tls.c: TLS 1.2 client (TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256) ---- */
+bool tls_connect(const char *host, const u8 ip[4], u16 port);
+u32  tls_send(const u8 *data, u32 len);
+u32  tls_recv(u8 *buf, u32 max_len, u32 timeout_ms);
+bool tls_eof(void);
+void tls_close(void);
+bool tls_selftest(void);
+
 /* ---- net.c: RTL8139 driver + Ethernet/ARP/IPv4/ICMP ------------------ */
 void       net_init(void);
 bool       net_ready(void);

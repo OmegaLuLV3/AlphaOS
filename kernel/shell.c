@@ -15,6 +15,7 @@ static void cmd_help(void)
            "  ping            ping the network gateway (needs a NIC)\n"
            "  nslookup <name> resolve a hostname via DNS (needs a NIC)\n"
            "  http <host> [path]  fetch a page over plain HTTP\n"
+           "  https <host> [path] fetch a page over TLS 1.2 (port 443)\n"
            "  ai <question>   ask the AI assistant (needs ai_bridge.py)\n"
            "  uptime          time since boot\n"
            "  clear           clear the screen\n"
@@ -139,6 +140,78 @@ static void cmd_http(char *arg)
     kprint("\n--- end ---\n");
 }
 
+static u32 shell_str_append(char *dst, u32 dst_max, const char *src)
+{
+    u32 n = 0;
+    while (src[n] && n + 1 < dst_max) {
+        dst[n] = src[n];
+        n++;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+static void cmd_https(char *arg)
+{
+    if (!net_ready()) {
+        kprint("https: no NIC (boot with -netdev user,id=net0 "
+               "-device rtl8139,netdev=net0)\n");
+        return;
+    }
+    char *host = arg;
+    char *path = arg;
+    while (*path && *path != ' ')
+        path++;
+    if (*path)
+        *path++ = 0;
+    while (*path == ' ')
+        path++;
+    if (!*host) {
+        kprint("usage: https <host> [path]\n");
+        return;
+    }
+
+    u8 ip[4];
+    if (!net_dns_resolve(host, ip)) {
+        kprint("https: DNS resolution failed\n");
+        return;
+    }
+    kprintf("TLS connect to %s:443 ...\n", host);
+    if (!tls_connect(host, ip, 443)) {
+        kprint("https: TLS handshake failed\n");
+        return;
+    }
+    kprint("TLS handshake OK\n");
+
+    char req[512];
+    u32 pos = 0;
+    pos += shell_str_append(req + pos, sizeof(req) - pos, "GET ");
+    pos += shell_str_append(req + pos, sizeof(req) - pos, *path ? path : "/");
+    pos += shell_str_append(req + pos, sizeof(req) - pos, " HTTP/1.1\r\nHost: ");
+    pos += shell_str_append(req + pos, sizeof(req) - pos, host);
+    pos += shell_str_append(req + pos, sizeof(req) - pos,
+                            "\r\nConnection: close\r\nUser-Agent: AlphaOS\r\n\r\n");
+    if (!tls_send((const u8 *)req, pos)) {
+        kprint("https: request send failed\n");
+        tls_close();
+        return;
+    }
+
+    static u8 resp[8192];
+    u32 total = 0;
+    while (total < sizeof(resp) - 1 && !tls_eof()) {
+        u32 n = tls_recv(resp + total, sizeof(resp) - 1 - total, 5000);
+        if (!n)
+            break;
+        total += n;
+    }
+    tls_close();
+    resp[total] = 0;
+    kprintf("--- %u bytes ---\n", total);
+    kprint((const char *)resp);
+    kprint("\n--- end ---\n");
+}
+
 static void cmd_run(const char *cmdline)
 {
     if (!*cmdline) {
@@ -223,6 +296,8 @@ void shell_run(void)
             cmd_nslookup(arg);
         else if (strcmp(line, "http") == 0)
             cmd_http(arg);
+        else if (strcmp(line, "https") == 0)
+            cmd_https(arg);
         else if (strcmp(line, "ai") == 0) {
             if (*arg)
                 ai_ask(arg);

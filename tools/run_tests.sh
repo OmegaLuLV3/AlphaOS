@@ -96,6 +96,9 @@ check "crypto: self-test passed"
 check "x509: self-test passed"
 # embedded trusted root CA set -- see kernel/roots.c
 check "x509: trusted-root self-test passed"
+# TLS 1.2 handshake logic (framing, key derivation, AEAD records) --
+# see kernel/tls.c
+check "tls: self-test passed"
 check "net: RTL8139 at io=.* irq=.* mac=.* ip=10.0.2.15"
 check "bga: 1024x768x32 framebuffer"
 check "gui: desktop ready"

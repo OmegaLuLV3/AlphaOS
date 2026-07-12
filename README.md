@@ -164,8 +164,9 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   `nslookup`'s targets never needed either, so nothing forced the bugs
   to surface until a request left the local virtual subnet for real.
   This is the foundation two much bigger asks (a browser, pulling
-  updates from GitHub) need under them; still no TLS — see the roadmap
-  below. Every byte this parses comes off the wire untrusted, and it's
+  updates from GitHub) need under them; TLS 1.2 now exists on top of
+  it (`https` command) — see the roadmap below. Every byte this
+  parses comes off the wire untrusted, and it's
   threat-modeled that way from the start; see `SECURITY.md` findings
   #14, #15, and #16 for the full history, including every bug found
   and fixed along the way.
@@ -202,9 +203,11 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   including the one case this doesn't cover yet (AlphaOS's own
   `mkpe.py`-built apps still ship as a single RWX section).
 - **AI assistant, safely split across the trust boundary** — an `ai
-  <question>` shell command backed by the real Claude API. AlphaOS has
-  no network/TLS stack (and won't grow one here — that's its own
-  project), so `kernel/ai.c` talks a tiny allowlisted protocol over a
+  <question>` shell command backed by the real Claude API. This
+  deliberately doesn't go over AlphaOS's own network/TLS stack (a
+  guest-side TLS client trusting a hardcoded root set is the wrong
+  place to also hold a real API key), so `kernel/ai.c` talks a tiny
+  allowlisted protocol over a
   second serial port to `tools/ai_bridge.py`, a host process that holds
   the actual API key. The guest-side handler is a closed five-way
   switch (`list_files`, `read_pe_info`, `mem_stats`, `pci_list`,
@@ -260,7 +263,8 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `date` | read the real-time clock |
 | `ping` | ARP-resolve + ICMP-ping the network gateway (needs a NIC) |
 | `nslookup <name>` | resolve a hostname via a real DNS query (needs a NIC) |
-| `http <host> [path]` | fetch a page over plain HTTP/1.1 (needs a NIC; no TLS yet) |
+| `http <host> [path]` | fetch a page over plain HTTP/1.1 (needs a NIC) |
+| `https <host> [path]` | fetch a page over TLS 1.2 (needs a NIC; RSA/ECDHE/AES-128-GCM only) |
 | `uptime`, `echo`, `clear`, `help`, `halt` | the usual |
 
 ## Bundled programs
@@ -353,10 +357,15 @@ prerequisite, so that's what's being built first:
 1. **Network stack foundation** — done: `net.c`'s RTL8139 driver +
    Ethernet/ARP/IPv4/ICMP/UDP/TCP (`ping`), a minimal DNS resolver
    (`nslookup`), and a minimal HTTP/1.1 client (`http`).
-2. **TLS** — not started; almost everything on the modern web requires
-   HTTPS, including GitHub's API and release downloads. `http` today
-   is plain-HTTP only, which the shell's own `usage` text says
-   outright rather than leaving implicit.
+2. **TLS** — done, scoped to exactly one cipher suite:
+   `TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256` (`kernel/crypto.c`'s
+   SHA-256/HMAC/PRF/AES-128-GCM/bignum/P-256/RSA, `kernel/x509.c`'s
+   ASN.1/X.509 parser, `kernel/roots.c`'s embedded trusted-root set,
+   `kernel/tls.c`'s handshake state machine, exposed as `https`).
+   Narrow on purpose — one suite, one curve, one signature scheme,
+   RSA-only chains, no renegotiation/resumption/client certs — see
+   `SECURITY.md` for the full scope and what's deliberately not
+   implemented yet.
 3. **A disk driver + a real writable filesystem** — not started;
    storage today is a read-only ramdisk rebuilt at compile time, so
    there's nowhere to persist a downloaded update (or a browser cache)
