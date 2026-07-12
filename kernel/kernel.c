@@ -79,6 +79,14 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     font_init();  /* capture the VGA font while still in text mode */
     pci_scan();
     mouse_init();
+    ata_init();   /* primary-master IDE disk, if present -- degrades
+                     gracefully if not (same pattern as net_init() below) */
+    if (ata_ready()) {
+        kprintf("ata: primary master, %u sectors (%u MiB)\n",
+               ata_sector_count(), ata_sector_count() / 2048);
+        bool fat_ok = fat_mount();
+        kprintf("fat: mount %s\n", fat_ok ? "OK" : "FAILED");
+    }
     net_init();   /* RTL8139 NIC, if present -- degrades gracefully if not */
     win32_init(); /* export tables for Windows-style .exe imports */
     ai_init();    /* host-bridged AI assistant channel (COM2) */

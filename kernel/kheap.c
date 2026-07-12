@@ -52,6 +52,16 @@ void *kmalloc(u32 size)
 {
     if (!size)
         return NULL;
+    /* SECURITY.md finding #13 fixed this exact overflow-to-undersized-
+       -allocation pattern one layer up, in proc_alloc(); the same
+       wraparound exists right here too -- size + 7 overflows for any
+       size within 7 of 0xFFFFFFFF, and the heap is only ever 16 MiB
+       (HEAP_SIZE), so no caller ever legitimately needs a size that
+       close to the u32 ceiling. Reject it outright rather than
+       silently rounding it down to a tiny real allocation while the
+       caller still believes it got the huge size it asked for. */
+    if (size > 0xFFFFFFFFu - 7)
+        return NULL;
     size = (size + 7) & ~7u;
 
     for (block_t *b = heap_head; b; b = b->next) {

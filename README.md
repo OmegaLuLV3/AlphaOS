@@ -83,14 +83,16 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
   `GetProcessHeap`, `HeapAlloc`/`HeapFree`, `GetCommandLineA`,
   `GetLastError`/`SetLastError`, `LoadLibraryA`, `GetProcAddress`,
   `lstrlenA`, and `user32.dll!MessageBoxA` — which draws a real modal
-  dialog with an OK button. Real file I/O is backed directly by the
-  ramdisk: `CreateFileA` only succeeds for `OPEN_EXISTING` +
-  `GENERIC_READ` against a file that's actually there — no writable
-  filesystem exists, so create/write/delete fail the same way a real
+  dialog with an OK button. Real file I/O now spans two backends:
+  the ramdisk stays strictly read-only (`CreateFileA` only succeeds
+  for `OPEN_EXISTING` + `GENERIC_READ` against a file that's actually
+  there — create/write/delete against it fail the same way a real
   `CreateFileA` fails against a read-only volume, rather than silently
-  pretending to succeed. Unresolved imports fail the load with the
-  missing `dll!symbol` named. Legacy AlphaOS-API programs (no imports)
-  still run; the loader picks the convention per binary.
+  pretending to succeed), and a real writable disk (ATA/IDE + FAT16,
+  see the roadmap below) backs `CREATE_ALWAYS`/`GENERIC_WRITE` against
+  a genuine persistent filesystem. Unresolved imports fail the load
+  with the missing `dll!symbol` named. Legacy AlphaOS-API programs (no
+  imports) still run; the loader picks the convention per binary.
 - **Real Win32 GUI apps, not just AlphaOS's own** — a `user32.dll`/
   `gdi32.dll` window/message subsystem (`RegisterClassA`,
   `CreateWindowExA`, `ShowWindow`/`UpdateWindow`, a real
@@ -224,16 +226,20 @@ binary: `RegisterClassA` → `CreateWindowExA` → a genuine
 Requirements: `gcc` (with x86-64 support — the default on most Linux
 distros), `binutils`, `make`, `python3`, `qemu-system-x86_64`,
 `grub-mkrescue` + `xorriso` (to build the bootable ISO — see below for
-why). Optional: `x86_64-w64-mingw32-gcc` (mingw-w64) to build and
+why), `mtools` (to format the writable disk image — see the roadmap
+below). Optional: `x86_64-w64-mingw32-gcc` (mingw-w64) to build and
 regression-test the real third-party compat binaries (a console app
 and a GUI app) — skipped cleanly if absent. No cross-compiler needed
 for AlphaOS itself.
 
 ```sh
-make          # build kernel, .exe apps, and a bootable GRUB ISO
+make          # build kernel, .exe apps, a bootable GRUB ISO, and a
+              # writable FAT16 disk image (build/disk.img, persists
+              # across `make` runs like a real disk -- `make clean`
+              # resets it)
 make run-vga  # boot the desktop in a QEMU window  <-- the fun one
 make run      # headless: serial console in your terminal (Ctrl-A X quits)
-make test     # scripted end-to-end boot test (56 assertions)
+make test     # scripted end-to-end boot test (73 assertions)
 make run-ai   # boot with the AI assistant's serial channel exposed;
               # pair with `ANTHROPIC_API_KEY=... python3 tools/ai_bridge.py`
               # (or --mock to try it with no API key at all)
@@ -265,6 +271,10 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `nslookup <name>` | resolve a hostname via a real DNS query (needs a NIC) |
 | `http <host> [path]` | fetch a page over plain HTTP/1.1 (needs a NIC) |
 | `https <host> [path]` | fetch a page over TLS 1.2 (needs a NIC; RSA/ECDHE/AES-128-GCM only) |
+| `lsdisk` | list files on the writable disk (ATA/IDE + FAT16, needs a disk) |
+| `cat <name>` | print a file from the writable disk |
+| `write <name> <text>` | create/overwrite a file on the writable disk |
+| `rm <name>` | delete a file from the writable disk |
 | `uptime`, `echo`, `clear`, `help`, `halt` | the usual |
 
 ## Bundled programs
@@ -281,6 +291,7 @@ via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 | `winhello.exe` | **Windows-style**: kernel32 imports only — console I/O, VirtualAlloc/HeapAlloc, GetProcAddress, ExitProcess |
 | `msgbox.exe` | **Windows-style**: `user32.dll!MessageBoxA` modal dialog |
 | `readfile.exe` | **Windows-style**: real file I/O — `CreateFileA`/`ReadFile`/`SetFilePointer`/`GetFileSize`/`CloseHandle` against a ramdisk file |
+| `diskfile.exe` | **Windows-style**: real *writable* file I/O — `CreateFileA(CREATE_ALWAYS, GENERIC_WRITE)`/`WriteFile`/`CloseHandle`, then reopened and read back — a genuine round trip through the ATA/FAT disk, not just an in-memory echo |
 | `allocbomb.exe` | security regression: a ~4GiB `VirtualAlloc`/`HeapAlloc` now fails cleanly instead of wrapping into heap corruption (see `SECURITY.md` #13) |
 | `compat/mingw_hello.c` → `mingw_hello.exe` | **real third-party binary**: unmodified default `x86_64-w64-mingw32-gcc` output, full CRT — built only if mingw-w64 is installed |
 | `compat/mingw_winapp.c` → `mingw_winapp.exe` | **real third-party GUI binary**: unmodified `-mwindows` mingw-w64 output — `RegisterClassA`/`CreateWindowExA`/message loop/`TextOutA` — built only if mingw-w64 is installed |
@@ -330,16 +341,16 @@ paging, validation, and exception recovery rather than privilege levels.
 Scope note: AlphaOS implements the Win32 *mechanism* (PE32+ imports,
 the real Microsoft x64 ABI, IAT patching) and a useful, growing API
 subset — kernel32 CRT startup support, a `msvcrt.dll` runtime, a
-`user32.dll`/`gdi32.dll` window/message subsystem, and real
-(read-only) file I/O against the ramdisk. A program written against
-this subset — including an unmodified, default-flags mingw-w64 build
-with full CRT startup, GUI apps that open real windows and paint
-through GDI, and apps that read real files back with `CreateFileA`/
-`ReadFile` — runs as-is, calling convention and all
-(`compat/mingw_hello.c`, `compat/mingw_winapp.c`,
-`compat/mingw_readfile.c`). Arbitrary off-the-shelf Windows software
-still generally won't: the full Win32 surface (a writable filesystem,
-registry, threads, networking, COM, richer GDI/USER32, ...) is a
+`user32.dll`/`gdi32.dll` window/message subsystem, and real file I/O
+against either the read-only ramdisk or a genuine writable disk
+(ATA/IDE + FAT16). A program written against this subset — including
+an unmodified, default-flags mingw-w64 build with full CRT startup,
+GUI apps that open real windows and paint through GDI, and apps that
+read real files back with `CreateFileA`/`ReadFile` — runs as-is,
+calling convention and all (`compat/mingw_hello.c`,
+`compat/mingw_winapp.c`, `compat/mingw_readfile.c`). Arbitrary
+off-the-shelf Windows software still generally won't: the full Win32
+surface (registry, threads, networking, COM, richer GDI/USER32, ...) is a
 Wine-sized project, and this subset is far from that. Unsupported
 imports are reported by name at load time — see `peinfo` on a real
 Windows binary for a demonstration of exactly how far the loader gets
@@ -366,14 +377,26 @@ prerequisite, so that's what's being built first:
    RSA-only chains, no renegotiation/resumption/client certs — see
    `SECURITY.md` for the full scope and what's deliberately not
    implemented yet.
-3. **A disk driver + a real writable filesystem** — not started;
-   storage today is a read-only ramdisk rebuilt at compile time, so
-   there's nowhere to persist a downloaded update (or a browser cache)
-   yet. Required for the updater specifically, not for a browser.
+3. **A disk driver + a real writable filesystem** — done: `kernel/
+   ata.c`'s polling PIO driver for the primary-master IDE drive, and
+   `kernel/fat.c`'s from-scratch FAT16 read+write filesystem on top of
+   it (short 8.3 names, no subdirectories — the smallest real,
+   standards-conforming subset that's actually enough to store an
+   update download or arbitrary files). Wired into `CreateFileA`/
+   `WriteFile`/`ReadFile`/`CloseHandle` (`kernel/win32.c`) alongside
+   the still-strictly-read-only ramdisk, and into the shell
+   (`lsdisk`/`cat`/`write`/`rm`). `build/disk.img` is formatted at
+   build time by mtools' `mformat` (a real, independent FAT
+   implementation) and persists across `make` runs like a real disk.
+   See `SECURITY.md` finding #18 for the two real bugs this surfaced:
+   an untrusted on-disk size field that could overflow `kmalloc()`
+   into heap corruption, and a real host-level disk flush stalling
+   long enough to corrupt console input.
 4. **Update verification + apply** — not started; whatever eventually
    downloads a new build must be cryptographically verified before
    it's trusted with anything, the same care this project's whole
-   security model is built around (see `SECURITY.md`).
+   security model is built around (see `SECURITY.md`). Storage to
+   write it to now exists (step 3).
 5. **A minimal HTML/CSS parser + text-mode renderer** — not started;
    this is the realistic ceiling for "a browser" here — never Firefox.
 
@@ -385,18 +408,20 @@ step 1 (a bounds bug, an entire bug *class* — DNS compression-pointer
 loops — sidestepped by construction, and two bugs in the TCP/HTTP work
 that only surfaced once a request actually left the local virtual
 network: no IP routing to a remote gateway, and data getting
-acknowledged after being silently dropped by a full receive buffer).
+acknowledged after being silently dropped by a full receive buffer),
+and finding #18 for step 3 above.
 
 ## Layout
 
 ```
 kernel/   boot.S (long-mode transition), GDT/IDT (64-bit), drivers
           (pci, bga, mouse, kbd, rtc, serial, font, net — RTL8139 +
-          Ethernet/ARP/IPv4/ICMP/UDP/TCP + DNS + HTTP client), pmm,
-          paging (4-level), kheap, ramdisk, PE32+ loader + import
-          resolver, Win32/msvcrt API (win32.c, ms_abi), ai.c (AI
-          channel), AlphaOS API, gfx primitives, window
-          manager/compositor, terminal, shell
+          Ethernet/ARP/IPv4/ICMP/UDP/TCP + DNS + HTTP/TLS client, ata —
+          IDE PIO disk), pmm, paging (4-level), kheap, ramdisk, fat.c
+          (writable FAT16 filesystem), PE32+ loader + import resolver,
+          Win32/msvcrt API (win32.c, ms_abi), ai.c (AI channel),
+          AlphaOS API, gfx primitives, window manager/compositor,
+          terminal, shell
 apps/     crt0.S, app.ld, alpha.h, sample programs; win32/ has the
           Windows-style runtime (win32.h, wincrt0.S, imports.list)
 compat/   mingw_hello.c, mingw_winapp.c, mingw_readfile.c — built by a

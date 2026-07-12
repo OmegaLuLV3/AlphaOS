@@ -41,7 +41,9 @@ typedef DWORD         *LPDWORD;
 #define IDCANCEL 2
 
 #define GENERIC_READ         0x80000000u
+#define GENERIC_WRITE        0x40000000u
 #define OPEN_EXISTING        3u
+#define CREATE_ALWAYS        2u
 #define FILE_BEGIN           0u
 #define FILE_CURRENT         1u
 #define FILE_END             2u

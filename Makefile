@@ -37,7 +37,7 @@ KOBJS := boot.o setjmp.o isr.o kernel.o console.o serial.o string.o \
          gdt.o idt.o pic.o pit.o keyboard.o pmm.o paging.o kheap.o \
          ramdisk.o pe.o api.o shell.o \
          pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o win32.o \
-         ai.o net.o crypto.o x509.o roots.o tls.o
+         ai.o net.o crypto.o x509.o roots.o tls.o ata.o fat.o
 KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------
@@ -46,7 +46,7 @@ APPS     := hello sysinfo memhog primes crash paint noexec
 APP_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(APPS)))
 
 # Windows-style apps: call the OS via PE imports (kernel32/user32)
-WINAPPS  := winhello msgbox readfile allocbomb
+WINAPPS  := winhello msgbox readfile allocbomb diskfile
 WIN_EXES := $(addprefix $(BUILD)/apps/,$(addsuffix .exe,$(WINAPPS)))
 IMPORTS  := apps/win32/imports.list
 
@@ -67,7 +67,7 @@ endif
 
 .PHONY: all run run-vga test clean
 
-all: $(BUILD)/kernel.elf $(BUILD)/initrd.img $(BUILD)/alphaos.iso
+all: $(BUILD)/kernel.elf $(BUILD)/initrd.img $(BUILD)/alphaos.iso $(BUILD)/disk.img
 
 $(BUILD)/kernel $(BUILD)/apps:
 	mkdir -p $@
@@ -153,6 +153,21 @@ $(BUILD)/alphaos.iso: $(BUILD)/kernel.elf $(BUILD)/initrd.img boot/grub.cfg
 	cp boot/grub.cfg $(BUILD)/iso/boot/grub/grub.cfg
 	grub-mkrescue -o $@ $(BUILD)/iso
 
+# ---- writable disk image (ata.c / fat.c) -------------------------------
+#
+# A blank 32MB FAT16 image, formatted with mtools' mformat (a real,
+# independent FAT implementation — not anything this codebase wrote)
+# rather than having AlphaOS format its own boot disk, which would be
+# both more code and a worse place to get subtly wrong. Only created
+# once: like a real disk, it persists whatever AlphaOS writes to it
+# across `make` runs; `make clean` removes it (a fresh, empty disk),
+# nothing else does.
+
+$(BUILD)/disk.img:
+	mkdir -p $(BUILD)
+	dd if=/dev/zero of=$@ bs=1M count=32 status=none
+	mformat -i $@ -v ALPHAOS ::
+
 # ---- run / test -----------------------------------------------------
 #
 # -netdev user,id=net0 -device rtl8139,netdev=net0: explicit rather than
@@ -160,9 +175,22 @@ $(BUILD)/alphaos.iso: $(BUILD)/kernel.elf $(BUILD)/initrd.img boot/grub.cfg
 # kernel/net.c's driver specifically targets the RTL8139 model and the
 # SLIRP "user" backend's default addressing (guest 10.0.2.15/24,
 # gateway 10.0.2.2). `ping` at the shell exercises the whole stack.
+#
+# -drive file=...,if=ide: the primary-master IDE disk kernel/ata.c
+# targets via the legacy 0x1F0-0x1F7 ports -- the default i440fx
+# machine's built-in PIIX3 IDE controller, no extra -device needed
+# (unlike the NIC, which QEMU doesn't attach by default at all).
+# -boot order=d: mandatory once a real disk is attached -- a formatted
+# FAT16 volume's boot sector ends in the same 0x55AA signature a real
+# MBR does, so SeaBIOS's *default* boot order (hard disk before
+# CD-ROM) tries to boot build/disk.img itself and hangs there instead
+# of ever reaching GRUB on the ISO. Explicit, not relying on whatever
+# SeaBIOS's default happens to be -- the same reasoning as every other
+# QEMU flag here.
 
 QEMU := qemu-system-x86_64 -m 128 -vga std -cdrom $(BUILD)/alphaos.iso \
-        -cpu qemu64,+rdrand \
+        -cpu qemu64,+rdrand -boot order=d \
+        -drive file=$(BUILD)/disk.img,format=raw,if=ide \
         -netdev user,id=net0 -device rtl8139,netdev=net0
 
 run: all

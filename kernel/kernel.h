@@ -248,6 +248,25 @@ typedef struct rtc_time {
 
 void rtc_read(rtc_time_t *t);
 
+/* ---- ata.c: ATA/IDE PIO disk driver (primary master, LBA28) ---------- */
+void ata_init(void);
+bool ata_ready(void);
+u32  ata_sector_count(void);
+bool ata_read_sector(u32 lba, u8 out[512]);
+bool ata_write_sector(u32 lba, const u8 in[512]);
+bool ata_flush_cache(void);
+
+/* ---- fat.c: minimal FAT16 read+write filesystem ----------------------- */
+bool fat_mount(void);
+bool fat_ready(void);
+bool fat_stat(const char *name, u32 *size_out, bool *is_dir_out);
+u32  fat_read_file(const char *name, u8 *buf, u32 max_len);
+bool fat_write_file(const char *name, const u8 *data, u32 len);
+bool fat_delete_file(const char *name);
+
+typedef struct { u8 name[11]; u32 size; bool is_dir; } fat_list_entry_t;
+u32 fat_list(fat_list_entry_t *out, u32 max_entries);
+
 /* ---- font.c ---------------------------------------------------------*/
 extern u8 vga_font[256 * 16];           /* 8x16 glyphs */
 void font_init(void);

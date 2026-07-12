@@ -709,9 +709,129 @@ independently cross-checked against Python during development
 (21/21 passing, including 5 negative cases, run under ASan/UBSan with
 no findings before being ported into the kernel self-test).
 
+### 18. A real writable disk (ATA/IDE + FAT16) — the first persistent
+storage this kernel has ever had, and two real bugs it surfaced
+
+**Where:** `kernel/ata.c` (a polling PIO driver for the primary-master
+IDE drive), `kernel/fat.c` (a from-scratch FAT16 read+write
+filesystem), `kernel/win32.c` (`CreateFileA`/`ReadFile`/`WriteFile`/
+`CloseHandle` extended to back a real disk file, not just the
+read-only ramdisk), `kernel/shell.c` (`lsdisk`/`cat`/`write`/`rm`),
+`kernel/kheap.c` (`kmalloc()`).
+
+**Scope, by design:** short (8.3) filenames only, no subdirectories
+(the root directory is the only directory), no long-filename entries
+parsed, whole-file read/write rather than positioned I/O, LBA28 only
+(128 GiB ceiling, comfortably more than the 32 MiB `build/disk.img`
+will ever need). `build/disk.img` itself is formatted by mtools'
+`mformat` — a real, independent FAT implementation — rather than by
+this codebase's own code, so `fat.c` only ever has to read an
+already-valid filesystem and write back updates that keep it valid,
+not implement `mkfs` correctness too. Every write commits durably
+(`ata_flush_cache()`) before `fat_write_file()`/`fat_delete_file()`
+report success.
+
+**Bug 1 — an untrusted on-disk `file_size` field could overflow an
+allocation into a heap-corrupting write (CWE-190) — critical.**
+`fat_dirent_t.file_size` is a plain 32-bit field read straight off the
+disk. `kernel/shell.c`'s original `cmd_cat()` trusted it directly:
+`kmalloc(size + 1)` followed by `fat_read_file(name, buf, size)`. For
+`size` near `0xFFFFFFFF`, `size + 1` wraps in `kmalloc()`'s own
+`(size + 7) & ~7u` rounding (a value like `0xFFFFFFFE` rounds down to
+`0`), so `kmalloc()` returns a real pointer into a block sized `0`
+while `cmd_cat()` still believes it got a `size`-byte buffer —
+`fat_read_file()` then copies real on-disk data up to the full
+(huge, attacker/corruption-controlled) `size` into that near-zero
+allocation, corrupting kernel heap metadata exactly the way finding
+#13 (`proc_alloc()`) did, one layer deeper: this time the wraparound
+lives inside `kmalloc()` itself, not just at one call site.
+`kernel/win32.c`'s disk-backed `CreateFileA` was already safe (it caps
+at a fixed `FAT_MAX_FILE_SIZE` and passes that fixed cap, not the
+untrusted `size`, as `fat_read_file()`'s `max_len`); `cmd_cat()` was
+the one path that wasn't. **Exploit path:** any way to get a corrupted
+or maliciously-crafted FAT16 image attached as the disk — plausible in
+a way the embedded trusted-root set or bundled ramdisk aren't, since
+`build/disk.img` is an ordinary host file that persists across runs
+and (unlike a compiled-in constant) nothing prevents a user or another
+process from editing it directly. **Fix, two layers:** `cmd_cat()` now
+rejects any `fat_stat()`-reported size over a fixed 4 MiB cap before
+ever calling `kmalloc()` (matching the bound `win32.c` already
+enforced for the same field); `kmalloc()` itself now rejects any
+`size > 0xFFFFFFFFu - 7` up front, closing the wraparound at its
+actual source so no future caller can hit this same class of bug
+through any other path. **Verification:** a 3-byte real file
+(`EVIL.TXT`) was written to `build/disk.img` via `mcopy`, then its
+on-disk `fat_dirent_t.file_size` field was patched directly (Python,
+`struct.pack_into`) to `0xFFFFFFF0` — confirmed on-disk via `mdir`
+showing "4294967280 bytes" — and AlphaOS booted against that
+poisoned image: `cat EVIL.TXT` printed `cat: EVIL.TXT: too large
+(4294967280 bytes)` and refused cleanly, `mem` showed heap usage
+identical to a clean boot's, and `run hello.exe` immediately
+afterward still executed correctly — proving the heap wasn't left
+corrupted, not just that the read was refused.
+
+**Bug 2 — a real host-level disk flush stalling long enough to corrupt
+console input (a genuine, not hypothetical, race).** `ata.c`'s
+`wait_not_busy()`/`wait_drq()` are bounded polling spin loops with no
+interrupt-driven fallback, the same pattern every other blocking
+operation in this kernel already uses. `ata_write_sector()` originally
+issued a blocking `FLUSH CACHE` after *every single sector write*, and
+`fat_write_file()`/`fat_set_entry()` (which keeps both FAT copies in
+sync) call it several times per file operation. Under real host I/O
+contention, a single `FLUSH CACHE` — which can drive a genuine
+`fsync()` of the backing file on the host — was measured taking
+several *seconds*, not the microseconds a bare virtual-disk command
+needs. `kernel/serial.c`'s COM1 console is polled, not interrupt-driven
+(its own header comment says so: "we poll"), so nothing drains the
+UART's 16-byte hardware FIFO while `ata.c` spins — a multi-second
+stall silently drops whatever's typed (or piped, for `tools/
+run_tests.sh`) during it, corrupting subsequent shell input in ways
+that looked at first like a shell or FAT bug but were neither: `make
+test` runs intermittently showed concatenated/truncated commands
+(e.g. `cat shcat shtest.txt`) exactly following a disk write. **Fix,
+two parts:** flushing was batched from once-per-sector to once per
+logical operation (`ata_flush_cache()`, called once at the end of
+`fat_write_file()`/`fat_delete_file()`) — fewer flushes, but a single
+flush can still legitimately take seconds under contention, so this
+alone wasn't sufficient; `wait_not_busy()`/`wait_drq()` now also
+periodically call `gui_pump()` (the same call `kernel/pit.c`'s
+`sleep_ms()` already makes, for the same reason) during a long wait,
+draining serial/keyboard input into its own 256-byte software queue
+so a slow flush can no longer silently eat console input. Pumping is
+paced by `pit_ticks()`, not by the loop's own iteration count —
+individual iterations can vary wildly in latency under contention
+(that's the whole problem), so a fixed iteration modulus can't be
+trusted to land often enough in wall-clock time. **Verification:**
+`tools/run_tests.sh` now exercises `write`/`cat`/`rm`/`lsdisk` and a
+disk-backed `CreateFileA`/`WriteFile` round trip (`apps/win32/
+diskfile.exe`) with sleeps sized to this environment's measured worst-
+case flush latency; two consecutive clean `make test` runs against a
+freshly-formatted disk image both passed 73/73, where the pre-fix
+version failed intermittently and unpredictably at the same point
+every time a real write happened.
+
+**Known limitations, disclosed rather than fixed in this pass:** no
+access control on the disk at all — any code, including any `.exe`
+loaded from the ramdisk, can read/write/delete any file on it via
+`CreateFileA`, which is consistent with this OS's existing ring-0-for-
+everything design (see "Known limitations" below) but worth naming
+explicitly now that there's a *persistent* resource for a rogue
+process to damage, not just RAM that's reclaimed at exit. No
+subdirectories, no long filenames, no journaling — a power loss or
+crash mid-write can leave the FAT and the directory entry
+inconsistent with each other (the dirent is written last, so the
+likelier failure mode is losing the new data while the old file/free
+space accounting stays consistent, not the reverse, but this was not
+formally verified). The disk image is trusted more than it probably
+should be in general — finding #18's bug 1 fix addresses the one
+concretely-identified allocation-size hazard from an untrusted
+`file_size`, but `fat.c`'s directory-walk and cluster-chain logic
+were not exhaustively fuzzed against arbitrary bit-flips the way
+`pe.c`'s PE loader or `x509.c`'s ASN.1 parser were in earlier passes.
+
 ## Verification
 
-Beyond `make test` (56 assertions, including the malicious-file checks
+Beyond `make test` (73 assertions, including the malicious-file checks
 below), three PE files were hand-crafted by binary-patching legitimate
 AlphaOS-built executables to trigger the specific bugs above:
 

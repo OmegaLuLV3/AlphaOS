@@ -12,63 +12,83 @@ LOG=$BUILD/test.log
 HAVE_MINGW=0
 [ -f "$BUILD/apps/mingw_hello.exe" ] && HAVE_MINGW=1
 
-feed() {
-    # GRUB (SeaBIOS -> GRUB2 -> our kernel) adds a few seconds versus a
-    # direct -kernel boot, so give it more time before the first command
-    sleep 5
-    for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
-               "sysinfo.exe" "run primes.exe" "run memhog.exe" \
-               "peinfo winhello.exe" "run winhello.exe with args" \
-               "run crash.exe" "run noexec.exe" "run readfile.exe" \
-               "run allocbomb.exe" \
-               "run nope.exe" \
-               "echo still alive" \
-               "lspci" "date" "mem" "uptime"; do
-        printf '%s\n' "$cmd"
-        sleep 1
-    done
-    printf 'ping\n'
-    sleep 3
-    # nslookup needs the *test runner's* real internet access (SLIRP
-    # forwards the DNS query to the host's actual resolver) -- unlike
-    # `ping`, which only ever talks to QEMU's own virtual gateway.
-    # Exercised here either way so a hang/crash would still be caught,
-    # but the check below accepts either a real answer or the clean
-    # "no answer" failure path, since this suite can't assume the
-    # environment running it has outbound DNS.
-    printf 'nslookup example.com\n'
-    sleep 3
-    # same "test runner's real internet access" caveat as nslookup
-    # above, plus TCP specifically -- pypi.org is used here (rather
-    # than example.com) only because it's a stable, well-known plain-
-    # HTTP-reachable host; nothing pypi-specific is asserted below.
-    printf 'http pypi.org /\n'
-    sleep 6
-    if [ "$HAVE_MINGW" = 1 ]; then
-        printf 'run mingw_hello.exe\n'
-        sleep 1.5
-        printf 'run mingw_readfile.exe\n'
-        sleep 1.5
-        # mingw_winapp.exe is a real GUI app with a GetMessageA message
-        # loop that only ends on a mouse click on its close button —
-        # this non-interactive harness can't provide that, so just
-        # confirm the loader parses its PE headers/imports correctly
-        # (peinfo) rather than actually running it into a hang.
-        printf 'peinfo mingw_winapp.exe\n'
-        sleep 1.5
-    fi
-    printf 'halt\n'
-}
+# Commands are sent one at a time, each only after the *real* "alpha> "
+# prompt for the previous one has actually appeared (tools/qemu_drive.py,
+# over a pty) rather than after a fixed sleep. A fixed-delay guess can't
+# be both fast and reliable: real ATA disk operations (kernel/ata.c) --
+# especially a FLUSH CACHE, which can drive a genuine fsync() of
+# build/disk.img -- have been observed taking anywhere from milliseconds
+# to several seconds depending on host I/O contention, and a guess big
+# enough to cover the slow case wastes time on every fast one, while a
+# guess sized for the fast case corrupts input on a slow one (bytes
+# arriving mid-command get lost, since kernel/serial.c's UART is polled,
+# not interrupt-driven, and just an ~8-line hardware FIFO deep).
+CMDS=$BUILD/test_commands.txt
+: > "$CMDS"
+add() { printf '%s\n' "$1" >> "$CMDS"; }
+
+for cmd in "help" "ls" "peinfo hello.exe" "run hello.exe" \
+           "sysinfo.exe" "run primes.exe" "run memhog.exe" \
+           "peinfo winhello.exe" "run winhello.exe with args" \
+           "run crash.exe" "run noexec.exe" "run readfile.exe" \
+           "run allocbomb.exe" \
+           "run nope.exe" \
+           "echo still alive" \
+           "lspci" "date" "mem" "uptime"; do
+    add "$cmd"
+done
+# writable FAT disk -- shell commands (write/cat/rm/lsdisk) and a real
+# Win32 CreateFileA(CREATE_ALWAYS/GENERIC_WRITE) round trip, both
+# through the real ATA/FAT driver stack (kernel/ata.c, kernel/fat.c)
+for cmd in "lsdisk" "cat shtest.txt" "lsdisk" \
+           "write shtest.txt hello from the test shell" \
+           "cat shtest.txt" "lsdisk" "rm shtest.txt" "lsdisk" \
+           "cat shtest.txt" \
+           "run diskfile.exe" "lsdisk" "cat DFTEST.TXT" \
+           "rm DFTEST.TXT"; do
+    add "$cmd"
+done
+add "ping"
+# nslookup needs the *test runner's* real internet access (SLIRP
+# forwards the DNS query to the host's actual resolver) -- unlike
+# `ping`, which only ever talks to QEMU's own virtual gateway.
+# Exercised here either way so a hang/crash would still be caught, but
+# the check below accepts either a real answer or the clean "no
+# answer" failure path, since this suite can't assume the environment
+# running it has outbound DNS.
+add "nslookup example.com"
+# same "test runner's real internet access" caveat as nslookup above,
+# plus TCP specifically -- pypi.org is used here (rather than
+# example.com) only because it's a stable, well-known plain-HTTP-
+# reachable host; nothing pypi-specific is asserted below.
+add "http pypi.org /"
+if [ "$HAVE_MINGW" = 1 ]; then
+    add "run mingw_hello.exe"
+    add "run mingw_readfile.exe"
+    # mingw_winapp.exe is a real GUI app with a GetMessageA message
+    # loop that only ends on a mouse click on its close button — this
+    # non-interactive harness can't provide that, so just confirm the
+    # loader parses its PE headers/imports correctly (peinfo) rather
+    # than actually running it into a hang.
+    add "peinfo mingw_winapp.exe"
+fi
+add "halt"
 
 # QEMU's own multiboot loader (-kernel) only accepts 32-bit ELF kernels;
 # AlphaOS is now x86-64, so it boots through the GRUB2 rescue ISO instead.
 # -netdev user,id=net0 -device rtl8139,netdev=net0: same reasoning as the
 # Makefile's $(QEMU) — explicit, not relying on QEMU's own default NIC.
-feed | timeout 120 qemu-system-x86_64 -m 128 -vga std \
+# -boot order=d: mandatory once a real disk is attached -- see the
+# Makefile's $(QEMU) comment for why (a formatted FAT16 boot sector
+# looks bootable to SeaBIOS too).
+python3 tools/qemu_drive.py "$LOG" "$CMDS" -- \
+    timeout 240 qemu-system-x86_64 -m 128 -vga std \
     -cdrom "$BUILD/alphaos.iso" \
-    -cpu qemu64,+rdrand \
+    -cpu qemu64,+rdrand -boot order=d \
+    -drive file="$BUILD/disk.img",format=raw,if=ide \
     -netdev user,id=net0 -device rtl8139,netdev=net0 \
-    -nographic -no-reboot | tee "$LOG"
+    -nographic -no-reboot
+cat "$LOG"
 
 echo
 echo "==== checking output ===="
@@ -88,6 +108,9 @@ check "AlphaOS 0.11"
 check "pci: .* device(s.*bus\|s)"                  # pci scan ran
 check "font: captured 8x16 VGA font"
 check "mouse: PS/2 mouse on IRQ 12"
+# ATA/IDE PIO disk driver + FAT16 filesystem -- see kernel/ata.c, kernel/fat.c
+check "ata: primary master, .* sectors"
+check "fat: mount OK"
 # SHA-256/HMAC-SHA256/TLS-PRF/AES-128-GCM known-answer vectors, checked
 # on the actual compiled kernel at boot -- see kernel/crypto.c
 check "crypto: self-test passed"
@@ -144,6 +167,21 @@ check "HeapAlloc correctly returned NULL"
 check "heap is intact after the rejected allocations"
 check "allocbomb.exe exited with code 0"
 check "not found"                                  # run nope.exe error path
+# writable FAT disk -- shell commands (kernel/shell.c) round-tripping
+# through the real ATA/FAT driver stack (kernel/ata.c, kernel/fat.c)
+check "write: shtest.txt: OK"
+check "hello from the test shell"                  # cat after write
+check "SHTEST.TXT"                                 # lsdisk shows it
+check "rm: shtest.txt: OK"
+check "cat: shtest.txt: not found"                 # cat after rm
+# real Win32 file I/O against the writable disk (CreateFileA with
+# CREATE_ALWAYS/GENERIC_WRITE, not just the read-only ramdisk)
+check "wrote DFTEST.TXT to the disk"
+check "disk round trip OK: read back exactly what was written"
+check "diskfile.exe exited with code 0"
+check "DFTEST.TXT"                                 # lsdisk shows it
+check "written by diskfile.exe via CreateFileA/WriteFile"  # cat DFTEST.TXT
+check "rm: DFTEST.TXT: OK"
 check "still alive"                                # shell survived the crash
 check "physical:"                                  # mem command
 # real network stack: RTL8139 TX/RX, ARP resolution, ICMP echo against

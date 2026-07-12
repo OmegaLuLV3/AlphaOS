@@ -73,40 +73,69 @@ static int WINAPI w_ReadConsoleA(void *handle, void *buf, u32 max,
 }
 
 /*
- * ---- file I/O (kernel32), backed directly by the read-only ramdisk --
+ * ---- file I/O (kernel32), backed by the read-only ramdisk and, now,
+ * the writable FAT16 disk (fat.c) ----------------------------------
  *
- * AlphaOS has no writable filesystem, so CreateFileA only ever succeeds
- * for OPEN_EXISTING + GENERIC_READ against a name that's actually on
- * the ramdisk (ramdisk.c) — every other combination (create, write,
- * delete, a name that doesn't exist) fails the call, the same way a
- * real CreateFileA fails against a read-only volume it lacks
- * permission on, rather than silently pretending to succeed. A
- * fixed-size handle table (reset per process, same pattern as
- * win_classes/hwnd_states above) tracks each open rd_file_t and read
- * position; handles live at a small fixed address range distinct from
- * every other magic handle value in this file (std handles 0x10-0x12,
- * the heap handle 0xA1FA, cursor/icon 0x1 — real HWND/GDI handles are
- * actual heap pointers, always far above this range).
+ * The ramdisk (ramdisk.c) stays exactly as strict as before: only
+ * ever OPEN_EXISTING + GENERIC_READ, never write/create/delete,
+ * because it really is read-only storage baked into the kernel image
+ * — pretending otherwise would be a lie the next reboot exposes.
+ * kernel/fat.c backs an actual writable volume now, so CreateFileA
+ * additionally supports OPEN_EXISTING and CREATE_ALWAYS against it
+ * with GENERIC_READ and/or GENERIC_WRITE, whenever `ata_ready() &&
+ * fat_ready()` (a NIC-less or diskless boot degrades this exactly
+ * like the ramdisk-only behavior before this existed).
+ *
+ * A disk-backed handle owns a single kmalloc'd buffer holding the
+ * whole file in memory between CreateFileA and CloseHandle -- fat.c's
+ * own read/write API is whole-file, not positioned, so this is where
+ * ReadFile/WriteFile/SetFilePointer's positioned semantics actually
+ * live; the real fat_write_file() only runs once, at CloseHandle,
+ * committing the buffer to disk. FAT_MAX_FILE_SIZE bounds that
+ * buffer -- large enough for a real downloaded update, small enough
+ * to leave headroom in the 16 MiB kernel heap for everything else;
+ * WriteFile past it fails cleanly (0 bytes written) rather than
+ * silently truncating.
+ *
+ * A fixed-size handle table (reset per process, same pattern as
+ * win_classes/hwnd_states above) tracks each open handle; handles
+ * live at a small fixed address range distinct from every other
+ * magic handle value in this file (std handles 0x10-0x12, the heap
+ * handle 0xA1FA, cursor/icon 0x1 — real HWND/GDI handles are actual
+ * heap pointers, always far above this range).
  */
 #define GENERIC_READ         0x80000000u
+#define GENERIC_WRITE        0x40000000u
 #define OPEN_EXISTING        3u
+#define CREATE_ALWAYS        2u
 #define FILE_BEGIN           0u
 #define FILE_CURRENT         1u
 #define FILE_END             2u
 #define INVALID_HANDLE_VALUE ((void *)(uptr)-1)
 #define MAX_OPEN_FILES 8
 #define FILE_HANDLE_BASE 0x2000u
+#define FAT_MAX_FILE_SIZE (4u * 1024 * 1024) /* 4 MiB per open disk file */
 
 typedef struct {
     bool             used;
-    const rd_file_t *file;
+    const rd_file_t *file;      /* ramdisk-backed (read-only); NULL if disk-backed */
+    u8              *disk_buf;  /* disk-backed (owned kmalloc, size FAT_MAX_FILE_SIZE); NULL if ramdisk-backed */
+    char             disk_name[13]; /* 8.3 name, committed to fat.c on close */
+    u32              size;      /* logical size: file->size, or bytes written so far */
     u32              pos;
+    bool             dirty;     /* disk-backed and opened with GENERIC_WRITE */
 } open_file_t;
 
 static open_file_t open_files[MAX_OPEN_FILES];
 
 static void win32_reset_file_state(void)
 {
+    for (u32 i = 0; i < MAX_OPEN_FILES; i++) {
+        if (open_files[i].used && open_files[i].disk_buf)
+            kfree(open_files[i].disk_buf); /* a crashed process's open
+                handles don't get a clean CloseHandle -- reclaim the
+                buffer here instead of leaking it every crash */
+    }
     memset(open_files, 0, sizeof(open_files));
 }
 
@@ -124,20 +153,63 @@ static void *WINAPI w_CreateFileA(const char *path, u32 access, u32 share,
                                    u32 flags, void *template_file)
 {
     (void)share; (void)sec_attrs; (void)flags; (void)template_file;
-    if (!path || disposition != OPEN_EXISTING || !(access & GENERIC_READ))
+    if (!path || !(access & (GENERIC_READ | GENERIC_WRITE)))
         return INVALID_HANDLE_VALUE;
-    const rd_file_t *f = ramdisk_find(path);
-    if (!f)
-        return INVALID_HANDLE_VALUE;
-    for (u32 i = 0; i < MAX_OPEN_FILES; i++) {
-        if (!open_files[i].used) {
-            open_files[i].used = true;
-            open_files[i].file = f;
-            open_files[i].pos = 0;
-            return (void *)(uptr)(FILE_HANDLE_BASE + i);
+
+    u32 slot = MAX_OPEN_FILES;
+    for (u32 i = 0; i < MAX_OPEN_FILES; i++)
+        if (!open_files[i].used) { slot = i; break; }
+    if (slot == MAX_OPEN_FILES)
+        return INVALID_HANDLE_VALUE; /* handle table full */
+
+    if (disposition == OPEN_EXISTING && !(access & GENERIC_WRITE)) {
+        const rd_file_t *f = ramdisk_find(path);
+        if (f) {
+            open_files[slot].used = true;
+            open_files[slot].file = f;
+            open_files[slot].size = f->size;
+            open_files[slot].pos = 0;
+            return (void *)(uptr)(FILE_HANDLE_BASE + slot);
         }
     }
-    return INVALID_HANDLE_VALUE; /* handle table full */
+
+    if (!ata_ready() || !fat_ready())
+        return INVALID_HANDLE_VALUE;
+
+    u8 *buf = kmalloc(FAT_MAX_FILE_SIZE);
+    if (!buf)
+        return INVALID_HANDLE_VALUE;
+    u32 size = 0;
+
+    if (disposition == OPEN_EXISTING) {
+        u32 existing_size;
+        bool is_dir;
+        if (!fat_stat(path, &existing_size, &is_dir) || is_dir ||
+            existing_size > FAT_MAX_FILE_SIZE) {
+            kfree(buf);
+            return INVALID_HANDLE_VALUE;
+        }
+        size = fat_read_file(path, buf, FAT_MAX_FILE_SIZE);
+        if (size != existing_size) {
+            kfree(buf);
+            return INVALID_HANDLE_VALUE;
+        }
+    } else if (disposition != CREATE_ALWAYS) {
+        kfree(buf);
+        return INVALID_HANDLE_VALUE; /* only these two dispositions
+                                         are supported against the FAT
+                                         disk */
+    }
+
+    open_files[slot].used = true;
+    open_files[slot].file = NULL;
+    open_files[slot].disk_buf = buf;
+    open_files[slot].size = size;
+    open_files[slot].pos = 0;
+    open_files[slot].dirty = false;
+    strncpy(open_files[slot].disk_name, path, sizeof(open_files[slot].disk_name) - 1);
+    open_files[slot].disk_name[sizeof(open_files[slot].disk_name) - 1] = 0;
+    return (void *)(uptr)(FILE_HANDLE_BASE + slot);
 }
 
 static int WINAPI w_ReadFile(void *handle, void *buf, u32 to_read,
@@ -148,9 +220,10 @@ static int WINAPI w_ReadFile(void *handle, void *buf, u32 to_read,
                 WriteFile below takes for console output */
         return w_ReadConsoleA(handle, buf, to_read, read_out, overlapped);
     (void)overlapped;
-    u32 remain = of->file->size - of->pos;
+    const u8 *data = of->file ? of->file->data : of->disk_buf;
+    u32 remain = of->size - of->pos;
     u32 n = to_read < remain ? to_read : remain;
-    memcpy(buf, of->file->data + of->pos, n);
+    memcpy(buf, data + of->pos, n);
     of->pos += n;
     if (read_out)
         *read_out = n;
@@ -160,21 +233,39 @@ static int WINAPI w_ReadFile(void *handle, void *buf, u32 to_read,
 static int WINAPI w_WriteFile(void *handle, const void *buf, u32 len,
                               u32 *written, void *overlapped)
 {
-    if (find_open_file(handle)) {
+    (void)overlapped;
+    open_file_t *of = find_open_file(handle);
+    if (!of)
+        return w_WriteConsoleA(handle, buf, len, written, overlapped);
+    if (!of->disk_buf) {
         /* ramdisk is read-only -- see this section's header comment */
         if (written)
             *written = 0;
         return 0;
     }
-    return w_WriteConsoleA(handle, buf, len, written, overlapped);
+    u32 remain = FAT_MAX_FILE_SIZE - of->pos;
+    u32 n = len < remain ? len : remain;
+    memcpy(of->disk_buf + of->pos, buf, n);
+    of->pos += n;
+    if (of->pos > of->size)
+        of->size = of->pos;
+    of->dirty = true;
+    if (written)
+        *written = n;
+    return n == len; /* a short write (buffer cap hit) is reported as
+                         a failure, not silently truncated */
 }
 
 static int WINAPI w_CloseHandle(void *handle)
 {
     open_file_t *of = find_open_file(handle);
     if (of) {
-        of->used = false;
-        of->file = NULL;
+        if (of->disk_buf) {
+            if (of->dirty)
+                fat_write_file(of->disk_name, of->disk_buf, of->size);
+            kfree(of->disk_buf);
+        }
+        memset(of, 0, sizeof(*of));
     }
     return 1; /* closing a non-file handle is a harmless no-op success */
 }
@@ -186,7 +277,7 @@ static u32 WINAPI w_GetFileSize(void *handle, u32 *high)
         return (u32)-1;
     if (high)
         *high = 0;
-    return of->file->size;
+    return of->size;
 }
 
 static u32 WINAPI w_SetFilePointer(void *handle, s32 distance, s32 *high,
@@ -196,10 +287,11 @@ static u32 WINAPI w_SetFilePointer(void *handle, s32 distance, s32 *high,
     open_file_t *of = find_open_file(handle);
     if (!of)
         return (u32)-1;
-    s64 base = method == FILE_END ? (s64)of->file->size
+    u32 limit = of->disk_buf ? FAT_MAX_FILE_SIZE : of->size;
+    s64 base = method == FILE_END ? (s64)of->size
              : method == FILE_CURRENT ? (s64)of->pos : 0;
     s64 newpos = base + distance;
-    if (newpos < 0 || newpos > (s64)of->file->size)
+    if (newpos < 0 || newpos > (s64)limit)
         return (u32)-1;
     of->pos = (u32)newpos;
     return of->pos;

@@ -7,6 +7,10 @@ static void cmd_help(void)
 {
     kprint("commands:\n"
            "  ls              list files on the ramdisk\n"
+           "  lsdisk          list files on the writable disk\n"
+           "  cat <name>      print a file from the writable disk\n"
+           "  write <name> <text>  create/overwrite a file on the disk\n"
+           "  rm <name>       delete a file from the writable disk\n"
            "  run <file.exe>  load and execute a PE executable\n"
            "  peinfo <file>   show PE headers of an executable\n"
            "  mem             physical memory and heap statistics\n"
@@ -36,6 +40,121 @@ static void cmd_ls(void)
         rd_file_t *f = ramdisk_get(i);
         kprintf("  %6u  %s\n", f->size, f->name);
     }
+}
+
+static bool disk_ready(const char *cmd)
+{
+    if (ata_ready() && fat_ready())
+        return true;
+    kprintf("%s: no writable disk (boot with "
+            "-drive file=disk.img,format=raw,if=ide)\n", cmd);
+    return false;
+}
+
+/* 11-byte space-padded 8.3 directory name -> "NAME.EXT" display string */
+static void format_83_name(const u8 name[11], char *out)
+{
+    u32 i = 0, o = 0;
+    while (i < 8 && name[i] != ' ')
+        out[o++] = (char)name[i++];
+    if (name[8] != ' ') {
+        out[o++] = '.';
+        for (i = 8; i < 11 && name[i] != ' '; i++)
+            out[o++] = (char)name[i];
+    }
+    out[o] = 0;
+}
+
+static void cmd_lsdisk(void)
+{
+    if (!disk_ready("lsdisk"))
+        return;
+    fat_list_entry_t entries[32];
+    u32 n = fat_list(entries, 32);
+    if (!n) {
+        kprint("(disk empty)\n");
+        return;
+    }
+    for (u32 i = 0; i < n; i++) {
+        char name[13];
+        format_83_name(entries[i].name, name);
+        kprintf("  %6u  %s%s\n", entries[i].size, name,
+                entries[i].is_dir ? "/" : "");
+    }
+}
+
+/* file_size comes straight off the disk (a fat_dirent_t field) --
+   trusting it unbounded for an allocation size is exactly the
+   overflow-to-undersized-allocation pattern SECURITY.md finding #13
+   fixed in proc_alloc(): kmalloc(size + 1) with size near UINT32_MAX
+   wraps, kmalloc() rounds the wrapped value down to a tiny real
+   allocation, and fat_read_file() would then happily memcpy up to the
+   original (huge, attacker/corruption-controlled) size into it. Cap
+   first, matching the bound kernel/win32.c's disk-backed CreateFileA
+   already enforces for the exact same field. */
+#define CAT_MAX_SIZE (4u * 1024 * 1024)
+
+static void cmd_cat(const char *name)
+{
+    if (!*name) {
+        kprint("usage: cat <name.ext>  (reads a file from the disk)\n");
+        return;
+    }
+    if (!disk_ready("cat"))
+        return;
+    u32 size;
+    bool is_dir;
+    if (!fat_stat(name, &size, &is_dir) || is_dir) {
+        kprintf("cat: %s: not found\n", name);
+        return;
+    }
+    if (size > CAT_MAX_SIZE) {
+        kprintf("cat: %s: too large (%u bytes)\n", name, size);
+        return;
+    }
+    u8 *buf = kmalloc(size + 1);
+    if (!buf) {
+        kprint("cat: out of memory\n");
+        return;
+    }
+    u32 n = fat_read_file(name, buf, size);
+    buf[n] = 0;
+    kprint((const char *)buf);
+    kprint("\n");
+    kfree(buf);
+}
+
+static void cmd_write(char *arg)
+{
+    char *name = arg;
+    char *text = arg;
+    while (*text && *text != ' ')
+        text++;
+    if (*text)
+        *text++ = 0;
+    while (*text == ' ')
+        text++;
+    if (!*name) {
+        kprint("usage: write <name.ext> <text>  (creates/overwrites a "
+               "file on the disk)\n");
+        return;
+    }
+    if (!disk_ready("write"))
+        return;
+    bool ok = fat_write_file(name, (const u8 *)text, strlen(text));
+    kprintf("write: %s: %s\n", name, ok ? "OK" : "FAILED");
+}
+
+static void cmd_rm(const char *name)
+{
+    if (!*name) {
+        kprint("usage: rm <name.ext>  (deletes a file from the disk)\n");
+        return;
+    }
+    if (!disk_ready("rm"))
+        return;
+    bool ok = fat_delete_file(name);
+    kprintf("rm: %s: %s\n", name, ok ? "OK" : "FAILED (not found?)");
 }
 
 static void cmd_mem(void)
@@ -243,6 +362,14 @@ void shell_run(void)
             cmd_help();
         else if (strcmp(line, "ls") == 0)
             cmd_ls();
+        else if (strcmp(line, "lsdisk") == 0)
+            cmd_lsdisk();
+        else if (strcmp(line, "cat") == 0)
+            cmd_cat(arg);
+        else if (strcmp(line, "write") == 0)
+            cmd_write(arg);
+        else if (strcmp(line, "rm") == 0)
+            cmd_rm(arg);
         else if (strcmp(line, "mem") == 0)
             cmd_mem();
         else if (strcmp(line, "uptime") == 0)
