@@ -140,17 +140,6 @@ static void cmd_http(char *arg)
     kprint("\n--- end ---\n");
 }
 
-static u32 shell_str_append(char *dst, u32 dst_max, const char *src)
-{
-    u32 n = 0;
-    while (src[n] && n + 1 < dst_max) {
-        dst[n] = src[n];
-        n++;
-    }
-    dst[n] = 0;
-    return n;
-}
-
 static void cmd_https(char *arg)
 {
     if (!net_ready()) {
@@ -171,43 +160,15 @@ static void cmd_https(char *arg)
         return;
     }
 
-    u8 ip[4];
-    if (!net_dns_resolve(host, ip)) {
-        kprint("https: DNS resolution failed\n");
-        return;
-    }
-    kprintf("TLS connect to %s:443 ...\n", host);
-    if (!tls_connect(host, ip, 443)) {
-        kprint("https: TLS handshake failed\n");
-        return;
-    }
-    kprint("TLS handshake OK\n");
-
-    char req[512];
-    u32 pos = 0;
-    pos += shell_str_append(req + pos, sizeof(req) - pos, "GET ");
-    pos += shell_str_append(req + pos, sizeof(req) - pos, *path ? path : "/");
-    pos += shell_str_append(req + pos, sizeof(req) - pos, " HTTP/1.1\r\nHost: ");
-    pos += shell_str_append(req + pos, sizeof(req) - pos, host);
-    pos += shell_str_append(req + pos, sizeof(req) - pos,
-                            "\r\nConnection: close\r\nUser-Agent: AlphaOS\r\n\r\n");
-    if (!tls_send((const u8 *)req, pos)) {
-        kprint("https: request send failed\n");
-        tls_close();
-        return;
-    }
-
     static u8 resp[8192];
-    u32 total = 0;
-    while (total < sizeof(resp) - 1 && !tls_eof()) {
-        u32 n = tls_recv(resp + total, sizeof(resp) - 1 - total, 5000);
-        if (!n)
-            break;
-        total += n;
+    kprintf("GET https://%s%s ...\n", host, *path ? path : "/");
+    u32 n = net_https_get(host, path, resp, sizeof(resp) - 1);
+    if (!n) {
+        kprint("https: request failed (DNS, TLS handshake, or empty response)\n");
+        return;
     }
-    tls_close();
-    resp[total] = 0;
-    kprintf("--- %u bytes ---\n", total);
+    resp[n] = 0;
+    kprintf("--- %u bytes ---\n", n);
     kprint((const char *)resp);
     kprint("\n--- end ---\n");
 }

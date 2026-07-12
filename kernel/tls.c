@@ -744,6 +744,54 @@ void tls_close(void)
     memset(&tls, 0, sizeof(tls));
 }
 
+static u32 tls_str_append(char *dst, u32 dst_max, const char *src)
+{
+    u32 n = 0;
+    while (src[n] && n + 1 < dst_max) {
+        dst[n] = src[n];
+        n++;
+    }
+    dst[n] = 0;
+    return n;
+}
+
+/* net_http_get()'s exact structure (kernel/net.c), over TLS on port
+   443 instead of plain TCP on port 80. Returns the number of response
+   bytes written to `out` (0 on any failure: DNS, handshake, or an
+   empty response). */
+u32 net_https_get(const char *host, const char *path, u8 *out, u32 out_max)
+{
+    if (!net_ready())
+        return 0;
+
+    u8 ip[4];
+    if (!net_dns_resolve(host, ip))
+        return 0;
+    if (!tls_connect(host, ip, 443))
+        return 0;
+
+    char req[512];
+    u32 pos = 0;
+    pos += tls_str_append(req + pos, sizeof(req) - pos, "GET ");
+    pos += tls_str_append(req + pos, sizeof(req) - pos, *path ? path : "/");
+    pos += tls_str_append(req + pos, sizeof(req) - pos, " HTTP/1.1\r\nHost: ");
+    pos += tls_str_append(req + pos, sizeof(req) - pos, host);
+    pos += tls_str_append(req + pos, sizeof(req) - pos,
+                          "\r\nConnection: close\r\nUser-Agent: AlphaOS\r\n\r\n");
+
+    u32 total = 0;
+    if (tls_send((const u8 *)req, pos) == pos) {
+        while (total < out_max && !tls_eof()) {
+            u32 n = tls_recv(out + total, out_max - total, 5000);
+            if (!n)
+                break;
+            total += n;
+        }
+    }
+    tls_close();
+    return total;
+}
+
 /* ---- self-test: known-answer vectors, checked at boot -------------------
  *
  * This runs at every boot, before crypto_ok even exists to check --

@@ -221,6 +221,7 @@ u32  tls_send(const u8 *data, u32 len);
 u32  tls_recv(u8 *buf, u32 max_len, u32 timeout_ms);
 bool tls_eof(void);
 void tls_close(void);
+u32  net_https_get(const char *host, const char *path, u8 *out, u32 out_max);
 bool tls_selftest(void);
 
 /* ---- net.c: RTL8139 driver + Ethernet/ARP/IPv4/ICMP ------------------ */
