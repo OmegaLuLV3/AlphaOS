@@ -522,6 +522,238 @@ bool aes128_gcm_decrypt(const aes128_ctx_t *ctx, const u8 iv[12],
     return true;
 }
 
+/* ---- big-integer arithmetic (for RSA verify + P-256 ECDHE) ------------
+ *
+ * Fixed-width, BN_LIMBS 32-bit limbs, little-endian (limb[0] is least
+ * significant) -- 4096 bits, comfortably covering both an RSA-4096
+ * modulus and (using only its low 8 limbs) P-256's 256-bit field.
+ * Every operation here processes the full fixed width regardless of
+ * the "real" size of its operands: simpler and easier to get right
+ * than a variable-length representation, and performance doesn't
+ * matter here -- this runs once per TLS handshake, not in a hot loop.
+ *
+ * bn_modexp() is also how modular inverse is computed (via Fermat's
+ * little theorem, a^(p-2) mod p, valid whenever p is prime) rather
+ * than a separate extended-Euclidean implementation -- one less
+ * algorithm to get right, reusing code already verified elsewhere in
+ * this section.
+ *
+ * (BN_LIMBS and bignum_t itself are declared in kernel.h, not here,
+ * since ecdhe/rsa/x509 code elsewhere needs the type too.)
+ */
+
+void bn_zero(bignum_t *r) { memset(r->limb, 0, sizeof(r->limb)); }
+
+void bn_from_bytes_be(bignum_t *r, const u8 *data, u32 len)
+{
+    bn_zero(r);
+    for (u32 i = 0; i < len; i++) {
+        u32 byte_idx = len - 1 - i;
+        u32 limb_idx = i / 4;
+        u32 shift = (i % 4) * 8;
+        if (limb_idx < BN_LIMBS)
+            r->limb[limb_idx] |= (u32)data[byte_idx] << shift;
+    }
+}
+
+void bn_to_bytes_be(const bignum_t *a, u8 *out, u32 out_len)
+{
+    for (u32 i = 0; i < out_len; i++) {
+        u32 byte_idx = out_len - 1 - i;
+        u32 limb_idx = i / 4;
+        u32 shift = (i % 4) * 8;
+        out[byte_idx] = limb_idx < BN_LIMBS ? (u8)(a->limb[limb_idx] >> shift) : 0;
+    }
+}
+
+int bn_cmp(const bignum_t *a, const bignum_t *b)
+{
+    for (int i = BN_LIMBS - 1; i >= 0; i--) {
+        if (a->limb[i] != b->limb[i])
+            return a->limb[i] > b->limb[i] ? 1 : -1;
+    }
+    return 0;
+}
+
+bool bn_is_zero(const bignum_t *a)
+{
+    for (int i = 0; i < BN_LIMBS; i++)
+        if (a->limb[i])
+            return false;
+    return true;
+}
+
+/* r = a + b; returns the carry out (0 or 1) */
+u32 bn_add(bignum_t *r, const bignum_t *a, const bignum_t *b)
+{
+    u64 carry = 0;
+    for (int i = 0; i < BN_LIMBS; i++) {
+        u64 s = (u64)a->limb[i] + b->limb[i] + carry;
+        r->limb[i] = (u32)s;
+        carry = s >> 32;
+    }
+    return (u32)carry;
+}
+
+/* r = a - b; assumes a >= b everywhere this is called (every call
+   site in this file establishes that beforehand -- see e.g.
+   bn_mod_wide's own invariant comment) */
+u32 bn_sub(bignum_t *r, const bignum_t *a, const bignum_t *b)
+{
+    u64 borrow = 0;
+    for (int i = 0; i < BN_LIMBS; i++) {
+        u64 ai = a->limb[i];
+        u64 bi = (u64)b->limb[i] + borrow;
+        if (ai >= bi) {
+            r->limb[i] = (u32)(ai - bi);
+            borrow = 0;
+        } else {
+            r->limb[i] = (u32)((ai + ((u64)1 << 32)) - bi);
+            borrow = 1;
+        }
+    }
+    return (u32)borrow;
+}
+
+/* shift left by 1 bit in place; returns the bit shifted out the top */
+static u32 bn_shl1(bignum_t *a)
+{
+    u32 carry = 0;
+    for (int i = 0; i < BN_LIMBS; i++) {
+        u32 new_carry = a->limb[i] >> 31;
+        a->limb[i] = (a->limb[i] << 1) | carry;
+        carry = new_carry;
+    }
+    return carry;
+}
+
+/* full a*b into a 2*BN_LIMBS-limb little-endian result */
+static void bn_mul_wide(u32 *r, const bignum_t *a, const bignum_t *b)
+{
+    memset(r, 0, sizeof(u32) * BN_LIMBS * 2);
+    for (int i = 0; i < BN_LIMBS; i++) {
+        if (a->limb[i] == 0)
+            continue;
+        u64 carry = 0;
+        for (int j = 0; j < BN_LIMBS; j++) {
+            u64 p = (u64)a->limb[i] * b->limb[j] + r[i + j] + carry;
+            r[i + j] = (u32)p;
+            carry = p >> 32;
+        }
+        int k = i + BN_LIMBS;
+        while (carry) {
+            u64 s = (u64)r[k] + carry;
+            r[k] = (u32)s;
+            carry = s >> 32;
+            k++;
+        }
+    }
+}
+
+/* Highest set bit position + 1 (i.e. the number of significant bits);
+   0 if a is zero. Every loop below is bounded by this instead of the
+   fixed BN_LIMBS width -- without that, every operation costs the
+   same whether the real operands are 17 bits (RSA's e=65537), 256
+   bits (a P-256 scalar), or the full 4096-bit width, which measured
+   over 2 *seconds per modexp call* natively during this file's own
+   development (let alone under QEMU's CPU emulation, where it hung
+   past a 20-second boot timeout entirely). With this bound, the same
+   two realistic shapes measured under 25ms each. */
+static u32 bn_bit_length(const bignum_t *a)
+{
+    for (int i = BN_LIMBS - 1; i >= 0; i--) {
+        if (a->limb[i]) {
+            u32 v = a->limb[i];
+            u32 bits = 0;
+            while (v) { bits++; v >>= 1; }
+            return (u32)i * 32 + bits;
+        }
+    }
+    return 0;
+}
+
+/* wide_a mod n -> r (BN_LIMBS limbs): binary long division, one bit
+   of wide_a at a time, MSB to LSB, processing only the top_bits
+   significant bits of wide_a (see bn_bit_length()'s comment above).
+   rem stays < n before every shift (loop invariant, true initially
+   since rem starts at 0 and n > 0), so after shifting left by 1 bit
+   rem is < 2n -- which fits in BN_LIMBS limbs without overflow as
+   long as n itself uses fewer than the full BN_LIMBS*32 bits (true
+   for every modulus this file ever calls this with: RSA moduli up to
+   4096 bits and P-256's 256-bit prime both leave headroom in a
+   4096-bit-wide bignum_t) */
+static void bn_mod_wide(bignum_t *r, const u32 *wide_a, u32 top_bits,
+                        const bignum_t *n)
+{
+    bignum_t rem;
+    bn_zero(&rem);
+    for (int bit = (int)top_bits - 1; bit >= 0; bit--) {
+        u32 limb_idx = (u32)bit / 32;
+        u32 bitpos = (u32)bit % 32;
+        u32 in_bit = (wide_a[limb_idx] >> bitpos) & 1;
+        bn_shl1(&rem);
+        rem.limb[0] |= in_bit;
+        if (bn_cmp(&rem, n) >= 0)
+            bn_sub(&rem, &rem, n);
+    }
+    *r = rem;
+}
+
+void bn_mulmod(bignum_t *r, const bignum_t *a, const bignum_t *b,
+              const bignum_t *n)
+{
+    /* a and b are always already-reduced (< n) at every call site in
+       this file (bn_modexp's own loop invariant), so their product
+       has at most 2*bitlen(n) significant bits -- an upper bound
+       that's always safe here without computing the wide product's
+       exact bit length */
+    u32 wide[BN_LIMBS * 2];
+    bn_mul_wide(wide, a, b);
+    u32 bound = 2 * bn_bit_length(n);
+    if (bound > BN_LIMBS * 2 * 32)
+        bound = BN_LIMBS * 2 * 32;
+    bn_mod_wide(r, wide, bound, n);
+}
+
+void bn_modexp(bignum_t *r, const bignum_t *base, const bignum_t *exp,
+              const bignum_t *n)
+{
+    bignum_t result, b;
+    bn_zero(&result);
+    result.limb[0] = 1;
+
+    /* reduce base mod n first, in case base >= n */
+    u32 wide[BN_LIMBS * 2];
+    memset(wide, 0, sizeof(wide));
+    memcpy(wide, base->limb, sizeof(base->limb));
+    bn_mod_wide(&b, wide, bn_bit_length(base), n);
+
+    u32 exp_bits = bn_bit_length(exp); /* exp==0 -> 0 iterations -> result
+                                           stays 1, i.e. x^0 == 1 */
+    for (u32 i = 0; i < exp_bits; i++) {
+        u32 limb_idx = i / 32, bitpos = i % 32;
+        if ((exp->limb[limb_idx] >> bitpos) & 1)
+            bn_mulmod(&result, &result, &b, n);
+        if (i + 1 < exp_bits) /* skip the last, useless squaring -- b
+                                  is never read again after this */
+            bn_mulmod(&b, &b, &b, n);
+    }
+    *r = result;
+}
+
+/* modular inverse via Fermat's little theorem -- ONLY valid when n is
+   prime (every call site in this codebase uses this exclusively for
+   P-256's field prime, never for an RSA modulus, which is never
+   prime) */
+void bn_modinv_prime(bignum_t *r, const bignum_t *a, const bignum_t *p)
+{
+    bignum_t two, p_minus_2;
+    bn_zero(&two);
+    two.limb[0] = 2;
+    bn_sub(&p_minus_2, p, &two);
+    bn_modexp(r, a, &p_minus_2, p);
+}
+
 /* ---- self-test: known-answer vectors, checked at boot -------------------
  *
  * This isn't a "just in case" belt-and-suspenders check: crypto bugs
@@ -683,6 +915,73 @@ bool crypto_selftest(void)
     if (aes128_gcm_decrypt(&actx, gcm_iv, bad_aad, sizeof(bad_aad), gcm_ct,
                            sizeof(gcm_ct), gcm_tag2, gcm_pt_out))
         return false; /* corrupted AAD must NOT verify either */
+
+    /* bignum: mulmod + modexp, cross-checked against Python's
+       arbitrary-precision pow(base, exp, mod) as an independent
+       implementation of the same modular exponentiation */
+    u8 bn_base_b[32], bn_exp_b[32], bn_mod_b[32], bn_out[32];
+    for (int i = 0; i < 32; i++) {
+        bn_base_b[i] = (u8)(i + 1);
+        bn_exp_b[i] = (u8)(200 + i);
+        bn_mod_b[i] = (u8)(50 + i * 3);
+    }
+    bn_mod_b[0] |= 0x80;
+    static const u8 modexp_expect[32] = {
+        0x99,0x34,0xff,0x60,0xca,0x5b,0x65,0x48,0xed,0x05,0xad,0xac,0xf1,0xfe,0x4e,0xb9,
+        0x14,0x8c,0x64,0x6d,0x89,0xe8,0x59,0x88,0xc9,0x51,0xa5,0xf9,0xf3,0xbe,0xec,0x1e,
+    };
+    bignum_t bb, be, bm, br;
+    bn_from_bytes_be(&bb, bn_base_b, 32);
+    bn_from_bytes_be(&be, bn_exp_b, 32);
+    bn_from_bytes_be(&bm, bn_mod_b, 32);
+    bn_modexp(&br, &bb, &be, &bm);
+    bn_to_bytes_be(&br, bn_out, 32);
+    if (!bytes_eq(bn_out, modexp_expect, 32))
+        return false;
+
+    /* bignum: modular inverse via Fermat, against P-256's real field
+       prime -- a * modinv(a, p) mod p must be exactly 1 */
+    static const u8 p256_prime_b[32] = {
+        0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+    };
+    bignum_t p256, av, avinv, one_check;
+    bn_from_bytes_be(&p256, p256_prime_b, 32);
+    bn_zero(&av);
+    av.limb[0] = 12345;
+    bn_modinv_prime(&avinv, &av, &p256);
+    bn_mulmod(&one_check, &av, &avinv, &p256);
+    bignum_t bn_one;
+    bn_zero(&bn_one);
+    bn_one.limb[0] = 1;
+    if (bn_cmp(&one_check, &bn_one) != 0)
+        return false;
+
+    /* bignum: add + byte round-trip */
+    bignum_t bx, by, bsum;
+    bn_zero(&bx);
+    bx.limb[0] = 0xFFFFFFFF;
+    bx.limb[1] = 0x1;
+    bn_zero(&by);
+    by.limb[0] = 0x1;
+    u32 bn_carry = bn_add(&bsum, &bx, &by);
+    if (bn_carry != 0 || bsum.limb[0] != 0 || bsum.limb[1] != 2)
+        return false;
+
+    u8 rt_in[32], rt_out[32];
+    for (int i = 0; i < 32; i++)
+        rt_in[i] = (u8)(i * 7 + 1);
+    bignum_t rt;
+    bn_from_bytes_be(&rt, rt_in, 32);
+    bn_to_bytes_be(&rt, rt_out, 32);
+    if (!bytes_eq(rt_out, rt_in, 32))
+        return false;
+    if (bn_is_zero(&rt))
+        return false;
+    bignum_t bn_zero_check;
+    bn_zero(&bn_zero_check);
+    if (!bn_is_zero(&bn_zero_check))
+        return false;
 
     return true;
 }

@@ -155,6 +155,21 @@ bool aes128_gcm_decrypt(const aes128_ctx_t *ctx, const u8 iv[12],
                         const u8 *aad, u32 aad_len, const u8 *ct, u32 ct_len,
                         const u8 tag[16], u8 *pt);
 
+#define BN_LIMBS 128
+typedef struct { u32 limb[BN_LIMBS]; } bignum_t;
+void bn_zero(bignum_t *r);
+void bn_from_bytes_be(bignum_t *r, const u8 *data, u32 len);
+void bn_to_bytes_be(const bignum_t *a, u8 *out, u32 out_len);
+int  bn_cmp(const bignum_t *a, const bignum_t *b);
+bool bn_is_zero(const bignum_t *a);
+u32  bn_add(bignum_t *r, const bignum_t *a, const bignum_t *b);
+u32  bn_sub(bignum_t *r, const bignum_t *a, const bignum_t *b);
+void bn_mulmod(bignum_t *r, const bignum_t *a, const bignum_t *b,
+              const bignum_t *n);
+void bn_modexp(bignum_t *r, const bignum_t *base, const bignum_t *exp,
+              const bignum_t *n);
+void bn_modinv_prime(bignum_t *r, const bignum_t *a, const bignum_t *p);
+
 bool crypto_selftest(void);
 extern bool crypto_ok; /* set once at boot; TLS code must check this
                            and refuse to run if the self-test failed */
