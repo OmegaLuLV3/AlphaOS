@@ -3,6 +3,8 @@
 
 extern u8 kernel_end; /* provided by the linker script */
 
+bool crypto_ok; /* set by crypto_selftest() in kmain(); see kernel.h */
+
 /*
  * SSE2 is mandatory baseline on real x86-64 (part of the ABI, not an
  * optional extension), so any externally-compiled binary — not just
@@ -50,6 +52,17 @@ void kmain(u32 magic, multiboot_info_t *mbi)
     paging_init();
     kheap_init();
     ramdisk_init(mbi);
+
+    /* Crypto self-test before anything is ever allowed to trust these
+       primitives for a real TLS connection: known-answer vectors,
+       checked on the actual compiled kernel code at boot, not just
+       once on a host prototype. A silently-wrong hash or PRF is a
+       fundamentally different (much worse) failure mode than a crash
+       -- see kernel/crypto.c's header comment. Fails closed: TLS code
+       checks crypto_ok() and refuses to run rather than trusting
+       primitives that didn't pass. */
+    crypto_ok = crypto_selftest();
+    kprintf("crypto: self-test %s\n", crypto_ok ? "passed" : "FAILED");
 
     /* driver bring-up */
     font_init();  /* capture the VGA font while still in text mode */

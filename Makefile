@@ -37,7 +37,7 @@ KOBJS := boot.o setjmp.o isr.o kernel.o console.o serial.o string.o \
          gdt.o idt.o pic.o pit.o keyboard.o pmm.o paging.o kheap.o \
          ramdisk.o pe.o api.o shell.o \
          pci.o rtc.o mouse.o font.o bga.o gfx.o terminal.o wm.o win32.o \
-         ai.o net.o
+         ai.o net.o crypto.o
 KOBJS := $(addprefix $(BUILD)/kernel/,$(KOBJS))
 
 # ---- apps -----------------------------------------------------------

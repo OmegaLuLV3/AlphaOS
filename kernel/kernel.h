@@ -127,6 +127,38 @@ u32        pci_count(void);
 pci_dev_t *pci_get(u32 i);
 pci_dev_t *pci_find(u16 vendor, u16 device);
 
+/* ---- crypto.c: SHA-256 / HMAC-SHA256 / TLS 1.2 PRF -------------------- */
+typedef struct {
+    u32 h[8];
+    u8  buf[64];
+    u32 buf_len;
+    u64 total_len;
+} sha256_ctx_t;
+
+void sha256_init(sha256_ctx_t *ctx);
+void sha256_update(sha256_ctx_t *ctx, const u8 *data, u64 len);
+void sha256_final(sha256_ctx_t *ctx, u8 out[32]);
+void sha256(const u8 *data, u32 len, u8 out[32]);
+void hmac_sha256(const u8 *key, u32 key_len, const u8 *data, u32 data_len,
+                 u8 out[32]);
+void tls_prf(const u8 *secret, u32 secret_len, const char *label,
+            const u8 *seed, u32 seed_len, u8 *out, u32 out_len);
+
+typedef struct { u8 rk[176]; } aes128_ctx_t;
+void aes128_set_key(aes128_ctx_t *ctx, const u8 key[16]);
+void aes128_encrypt_block(const aes128_ctx_t *ctx, const u8 in[16],
+                          u8 out[16]);
+void aes128_gcm_encrypt(const aes128_ctx_t *ctx, const u8 iv[12],
+                        const u8 *aad, u32 aad_len, const u8 *pt, u32 pt_len,
+                        u8 *ct, u8 tag[16]);
+bool aes128_gcm_decrypt(const aes128_ctx_t *ctx, const u8 iv[12],
+                        const u8 *aad, u32 aad_len, const u8 *ct, u32 ct_len,
+                        const u8 tag[16], u8 *pt);
+
+bool crypto_selftest(void);
+extern bool crypto_ok; /* set once at boot; TLS code must check this
+                           and refuse to run if the self-test failed */
+
 /* ---- net.c: RTL8139 driver + Ethernet/ARP/IPv4/ICMP ------------------ */
 void       net_init(void);
 bool       net_ready(void);
