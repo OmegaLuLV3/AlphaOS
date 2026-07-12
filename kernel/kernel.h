@@ -178,6 +178,11 @@ bool p256_generate_keypair(u8 priv_out[32], u8 pub_x_out[32], u8 pub_y_out[32]);
 bool p256_ecdh_shared_secret(const u8 priv[32], const u8 peer_x[32],
                              const u8 peer_y[32], u8 shared_x_out[32]);
 
+/* ---- crypto.c: RSA PKCS#1 v1.5 signature verification (SHA-256) ------ */
+bool rsa_verify_pkcs1v15_sha256(const bignum_t *n, const bignum_t *e,
+                                const bignum_t *sig, u32 mod_len,
+                                const u8 hash[32]);
+
 bool crypto_selftest(void);
 extern bool crypto_ok; /* set once at boot; TLS code must check this
                            and refuse to run if the self-test failed */
