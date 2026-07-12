@@ -211,6 +211,10 @@ bool x509_parse_certificate(const u8 *der, u32 der_len, x509_cert_t *out);
 bool x509_hostname_matches(const x509_cert_t *cert, const char *hostname);
 bool x509_selftest(void);
 
+/* ---- roots.c: embedded trusted root CA set ---------------------------- */
+bool x509_find_trusted_root(const u8 *issuer_der, u32 issuer_len, x509_cert_t *out);
+bool x509_roots_selftest(void);
+
 /* ---- net.c: RTL8139 driver + Ethernet/ARP/IPv4/ICMP ------------------ */
 void       net_init(void);
 bool       net_ready(void);

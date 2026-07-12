@@ -94,6 +94,8 @@ check "crypto: self-test passed"
 # ASN.1 DER / X.509 parsing against a real embedded certificate -- see
 # kernel/x509.c
 check "x509: self-test passed"
+# embedded trusted root CA set -- see kernel/roots.c
+check "x509: trusted-root self-test passed"
 check "net: RTL8139 at io=.* irq=.* mac=.* ip=10.0.2.15"
 check "bga: 1024x768x32 framebuffer"
 check "gui: desktop ready"
