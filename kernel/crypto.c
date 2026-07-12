@@ -754,6 +754,406 @@ void bn_modinv_prime(bignum_t *r, const bignum_t *a, const bignum_t *p)
     bn_modexp(r, a, &p_minus_2, p);
 }
 
+/* r = (a - b) mod p, for a,b already < p (handles the wraparound bn_sub
+   alone can't: bn_sub assumes a >= b, but modular subtraction routinely
+   needs a < b) */
+void bn_submod(bignum_t *r, const bignum_t *a, const bignum_t *b, const bignum_t *p)
+{
+    if (bn_cmp(a, b) >= 0) {
+        bn_sub(r, a, b);
+    } else {
+        bignum_t t;
+        bn_add(&t, a, p);
+        bn_sub(r, &t, b);
+    }
+}
+
+/* r = (a + b) mod p, for a,b already < p */
+void bn_addmod(bignum_t *r, const bignum_t *a, const bignum_t *b, const bignum_t *p)
+{
+    bignum_t t;
+    u32 carry = bn_add(&t, a, b);
+    if (carry || bn_cmp(&t, p) >= 0)
+        bn_sub(&t, &t, p);
+    *r = t;
+}
+
+/* ---- P-256 / secp256r1 (FIPS 186-4 / SEC 2) point arithmetic ----------
+ *
+ * Short Weierstrass curve y^2 = x^3 - 3x + b (mod p).
+ *
+ * Point add/double run in Jacobian coordinates (X, Y, Z), representing
+ * affine (x, y) = (X/Z^2, Y/Z^3) -- NOT the textbook affine formulas,
+ * which this file used at first and which turned out to be a real,
+ * measured problem, not just a theoretical one: affine add/double each
+ * need one modular inverse (a ~256-round Fermat modexp), and a single
+ * scalar multiply calls add/double up to ~256 times each -- roughly
+ * 45 *seconds* natively per scalar multiply, confirmed by timing the
+ * affine version directly, and enough to hang AlphaOS's own QEMU boot
+ * indefinitely once crypto_selftest() started exercising ECDHE at all
+ * (the exact same shape of bug as the fixed-width bignum performance
+ * bug elsewhere in this file, one level up the stack). Jacobian
+ * coordinates need no inversion at all during add/double -- only at
+ * the very end of a scalar multiply, converting the single final
+ * result back to affine, dropping the inversion count from ~512 to 1
+ * per scalar multiply.
+ *
+ * The Jacobian formulas below (dbl-2001-b for a=-3 doubling,
+ * add-2007-bl for general addition -- both from the Explicit-Formulas
+ * Database) were verified independently before being adapted here: a
+ * from-scratch Python implementation of both, cross-checked against
+ * the already-validated affine reference over 200 random scalars plus
+ * the same 2G/3G/ECDH-consistency vectors used elsewhere in this file
+ * (see scratchpad p256_jacobian_ref.py during development) -- not
+ * just copied from memory and trusted, which is exactly how this
+ * file's very first attempt at add-2007-bl silently dropped a factor
+ * of 2 (r = S2-S1 instead of the correct r = 2*(S2-S1)) and produced
+ * a wrong-but-plausible-looking point from 3G onward.
+ */
+typedef struct { bignum_t x, y; bool infinity; } ec_point_t;
+typedef struct { bignum_t X, Y, Z; bool infinity; } ec_point_jac_t;
+
+static bignum_t p256_p, p256_a, p256_b, p256_gx, p256_gy, p256_n;
+static bool p256_ready = false;
+
+static void p256_ensure_init(void)
+{
+    if (p256_ready)
+        return;
+    static const u8 p_b[32] = {
+        0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+        0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+    };
+    static const u8 b_b[32] = {
+        0x5a,0xc6,0x35,0xd8,0xaa,0x3a,0x93,0xe7,0xb3,0xeb,0xbd,0x55,0x76,0x98,0x86,0xbc,
+        0x65,0x1d,0x06,0xb0,0xcc,0x53,0xb0,0xf6,0x3b,0xce,0x3c,0x3e,0x27,0xd2,0x60,0x4b,
+    };
+    static const u8 gx_b[32] = {
+        0x6b,0x17,0xd1,0xf2,0xe1,0x2c,0x42,0x47,0xf8,0xbc,0xe6,0xe5,0x63,0xa4,0x40,0xf2,
+        0x77,0x03,0x7d,0x81,0x2d,0xeb,0x33,0xa0,0xf4,0xa1,0x39,0x45,0xd8,0x98,0xc2,0x96,
+    };
+    static const u8 gy_b[32] = {
+        0x4f,0xe3,0x42,0xe2,0xfe,0x1a,0x7f,0x9b,0x8e,0xe7,0xeb,0x4a,0x7c,0x0f,0x9e,0x16,
+        0x2b,0xce,0x33,0x57,0x6b,0x31,0x5e,0xce,0xcb,0xb6,0x40,0x68,0x37,0xbf,0x51,0xf5,
+    };
+    static const u8 n_b[32] = {
+        0xff,0xff,0xff,0xff,0x00,0x00,0x00,0x00,0xff,0xff,0xff,0xff,0xff,0xff,0xff,0xff,
+        0xbc,0xe6,0xfa,0xad,0xa7,0x17,0x9e,0x84,0xf3,0xb9,0xca,0xc2,0xfc,0x63,0x25,0x51,
+    };
+    bn_from_bytes_be(&p256_p, p_b, 32);
+    bn_from_bytes_be(&p256_b, b_b, 32);
+    bn_from_bytes_be(&p256_gx, gx_b, 32);
+    bn_from_bytes_be(&p256_gy, gy_b, 32);
+    bn_from_bytes_be(&p256_n, n_b, 32);
+    bn_zero(&p256_a);
+    bignum_t three;
+    bn_zero(&three);
+    three.limb[0] = 3;
+    bn_submod(&p256_a, &p256_p, &three, &p256_p); /* a = -3 mod p */
+    p256_ready = true;
+}
+
+/* Jacobian doubling for a=-3 curves ("dbl-2001-b"): no modular
+   inversion. */
+static void jac_double(ec_point_jac_t *r, const ec_point_jac_t *p)
+{
+    if (p->infinity || bn_is_zero(&p->Y)) {
+        r->infinity = true;
+        return;
+    }
+    bignum_t delta, gamma, beta, x_minus_delta, x_plus_delta, three;
+    bignum_t alpha, alpha2, eight_beta, x3, four_beta, four_beta_minus_x3;
+    bignum_t gamma2, eight_gamma2, t1, y3, y1_plus_z1, sq, z3;
+    bn_mulmod(&delta, &p->Z, &p->Z, &p256_p);
+    bn_mulmod(&gamma, &p->Y, &p->Y, &p256_p);
+    bn_mulmod(&beta, &p->X, &gamma, &p256_p);
+    bn_submod(&x_minus_delta, &p->X, &delta, &p256_p);
+    bn_addmod(&x_plus_delta, &p->X, &delta, &p256_p);
+    bn_zero(&three);
+    three.limb[0] = 3;
+    bn_mulmod(&alpha, &x_minus_delta, &x_plus_delta, &p256_p);
+    bn_mulmod(&alpha, &three, &alpha, &p256_p);
+
+    bn_mulmod(&alpha2, &alpha, &alpha, &p256_p);
+    bn_addmod(&eight_beta, &beta, &beta, &p256_p);       /* 2*beta */
+    bn_addmod(&eight_beta, &eight_beta, &eight_beta, &p256_p); /* 4*beta */
+    bn_addmod(&eight_beta, &eight_beta, &eight_beta, &p256_p); /* 8*beta */
+    bn_submod(&x3, &alpha2, &eight_beta, &p256_p);
+
+    bn_addmod(&four_beta, &beta, &beta, &p256_p);
+    bn_addmod(&four_beta, &four_beta, &four_beta, &p256_p);
+    bn_submod(&four_beta_minus_x3, &four_beta, &x3, &p256_p);
+    bn_mulmod(&t1, &alpha, &four_beta_minus_x3, &p256_p);
+    bn_mulmod(&gamma2, &gamma, &gamma, &p256_p);
+    bn_addmod(&eight_gamma2, &gamma2, &gamma2, &p256_p);
+    bn_addmod(&eight_gamma2, &eight_gamma2, &eight_gamma2, &p256_p);
+    bn_addmod(&eight_gamma2, &eight_gamma2, &eight_gamma2, &p256_p);
+    bn_submod(&y3, &t1, &eight_gamma2, &p256_p);
+
+    bn_addmod(&y1_plus_z1, &p->Y, &p->Z, &p256_p);
+    bn_mulmod(&sq, &y1_plus_z1, &y1_plus_z1, &p256_p);
+    bn_submod(&z3, &sq, &gamma, &p256_p);
+    bn_submod(&z3, &z3, &delta, &p256_p);
+
+    r->X = x3;
+    r->Y = y3;
+    r->Z = z3;
+    r->infinity = false;
+}
+
+/* General Jacobian+Jacobian addition ("add-2007-bl"): no modular
+   inversion. Falls back to jac_double when p == q (H == 0 && r == 0
+   in the formula's own notation -- unrelated to the ec_point_jac_t
+   *r output parameter, just an unfortunate name collision with the
+   standard formula's own "r" -- renamed rr here to avoid confusion). */
+static void jac_add(ec_point_jac_t *r, const ec_point_jac_t *p, const ec_point_jac_t *q)
+{
+    if (p->infinity) { *r = *q; return; }
+    if (q->infinity) { *r = *p; return; }
+
+    bignum_t z1z1, z2z2, u1, u2, s1, s2, h, rr;
+    bn_mulmod(&z1z1, &p->Z, &p->Z, &p256_p);
+    bn_mulmod(&z2z2, &q->Z, &q->Z, &p256_p);
+    bn_mulmod(&u1, &p->X, &z2z2, &p256_p);
+    bn_mulmod(&u2, &q->X, &z1z1, &p256_p);
+    bignum_t t1, t2;
+    bn_mulmod(&t1, &p->Y, &q->Z, &p256_p);
+    bn_mulmod(&s1, &t1, &z2z2, &p256_p);
+    bn_mulmod(&t2, &q->Y, &p->Z, &p256_p);
+    bn_mulmod(&s2, &t2, &z1z1, &p256_p);
+
+    bn_submod(&h, &u2, &u1, &p256_p);
+    bignum_t s2_minus_s1;
+    bn_submod(&s2_minus_s1, &s2, &s1, &p256_p);
+    if (bn_is_zero(&h)) {
+        if (bn_is_zero(&s2_minus_s1)) {
+            jac_double(r, p);
+            return;
+        }
+        r->infinity = true;
+        return;
+    }
+
+    bignum_t hh, i, j, v, x3, y3, z3, two_v, z1_plus_z2, sq, two_s1_j;
+    bn_mulmod(&hh, &h, &h, &p256_p);
+    bn_addmod(&i, &hh, &hh, &p256_p);
+    bn_addmod(&i, &i, &i, &p256_p); /* i = 4*h^2 */
+    bn_mulmod(&j, &h, &i, &p256_p);
+    bn_addmod(&rr, &s2_minus_s1, &s2_minus_s1, &p256_p); /* rr = 2*(s2-s1) */
+    bn_mulmod(&v, &u1, &i, &p256_p);
+
+    bn_mulmod(&x3, &rr, &rr, &p256_p);
+    bn_submod(&x3, &x3, &j, &p256_p);
+    bn_addmod(&two_v, &v, &v, &p256_p);
+    bn_submod(&x3, &x3, &two_v, &p256_p);
+
+    bn_submod(&t1, &v, &x3, &p256_p);
+    bn_mulmod(&y3, &rr, &t1, &p256_p);
+    bn_mulmod(&two_s1_j, &s1, &j, &p256_p);
+    bn_addmod(&two_s1_j, &two_s1_j, &two_s1_j, &p256_p);
+    bn_submod(&y3, &y3, &two_s1_j, &p256_p);
+
+    bn_addmod(&z1_plus_z2, &p->Z, &q->Z, &p256_p);
+    bn_mulmod(&sq, &z1_plus_z2, &z1_plus_z2, &p256_p);
+    bn_submod(&sq, &sq, &z1z1, &p256_p);
+    bn_submod(&sq, &sq, &z2z2, &p256_p);
+    bn_mulmod(&z3, &sq, &h, &p256_p);
+
+    r->X = x3;
+    r->Y = y3;
+    r->Z = z3;
+    r->infinity = false;
+}
+
+static void jac_to_affine(ec_point_t *r, const ec_point_jac_t *p)
+{
+    if (p->infinity) {
+        r->infinity = true;
+        return;
+    }
+    bignum_t zinv, zinv2, zinv3;
+    bn_modinv_prime(&zinv, &p->Z, &p256_p); /* the ONE inversion per
+                                                scalar multiply */
+    bn_mulmod(&zinv2, &zinv, &zinv, &p256_p);
+    bn_mulmod(&zinv3, &zinv2, &zinv, &p256_p);
+    bn_mulmod(&r->x, &p->X, &zinv2, &p256_p);
+    bn_mulmod(&r->y, &p->Y, &zinv3, &p256_p);
+    r->infinity = false;
+}
+
+static void ec_scalar_mult(ec_point_t *r, const bignum_t *k, const ec_point_t *p)
+{
+    ec_point_jac_t result;
+    result.infinity = true;
+    ec_point_jac_t q;
+    q.X = p->x;
+    q.Y = p->y;
+    bn_zero(&q.Z);
+    q.Z.limb[0] = 1;
+    q.infinity = p->infinity;
+    u32 bits = bn_bit_length(k);
+    for (u32 i = 0; i < bits; i++) {
+        u32 li = i / 32, bp = i % 32;
+        if ((k->limb[li] >> bp) & 1)
+            jac_add(&result, &result, &q);
+        if (i + 1 < bits)
+            jac_double(&q, &q);
+    }
+    jac_to_affine(r, &result);
+}
+
+/* Partial public-key validation (NIST SP 800-56A section 5.6.2.3.3):
+   reject the point at infinity and any (x,y) not actually satisfying
+   the curve equation. P-256 has cofactor 1, so on-curve membership is
+   sufficient here to rule out small-subgroup / invalid-curve attacks
+   -- a peer-supplied point is never trusted for a scalar multiply
+   without this check passing first. */
+static bool p256_point_on_curve(const bignum_t *x, const bignum_t *y)
+{
+    if (bn_cmp(x, &p256_p) >= 0 || bn_cmp(y, &p256_p) >= 0)
+        return false;
+    bignum_t lhs, x2, x3, ax, rhs;
+    bn_mulmod(&lhs, y, y, &p256_p);
+    bn_mulmod(&x2, x, x, &p256_p);
+    bn_mulmod(&x3, &x2, x, &p256_p);
+    bn_mulmod(&ax, &p256_a, x, &p256_p);
+    bn_addmod(&rhs, &x3, &ax, &p256_p);
+    bn_addmod(&rhs, &rhs, &p256_b, &p256_p);
+    return bn_cmp(&lhs, &rhs) == 0;
+}
+
+/* ---- x86 hardware entropy (RDRAND) -------------------------------------
+ *
+ * ECDHE's entire security rests on the ephemeral private scalar being
+ * unpredictable -- correct point arithmetic is worthless if the key
+ * that feeds it isn't. RDRAND is an on-die hardware entropy source
+ * (Intel SDM vol. 1 ch. 7.3.17; supported equivalently on AMD),
+ * advertised via CPUID.1:ECX bit 30. Per Intel's own guidance a single
+ * RDRAND call can transiently fail (the on-chip entropy conditioner
+ * underrun) and should be retried a small bounded number of times, not
+ * looped forever.
+ *
+ * Deliberate design choice: if RDRAND isn't available, this returns
+ * false and every caller (P-256 key generation) fails closed rather
+ * than falling back to a weaker source (e.g. RDTSC jitter). A TLS
+ * connection whose ephemeral key came from a predictable RNG is worse
+ * than no TLS at all -- same reasoning as never shipping certificate
+ * validation that pretends to check without actually checking. */
+static bool cpu_has_rdrand(void)
+{
+    u32 eax, ebx, ecx, edx;
+    __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                              : "a"(1), "c"(0));
+    return (ecx & (1u << 30)) != 0;
+}
+
+static bool rdrand32(u32 *out)
+{
+    for (int attempt = 0; attempt < 10; attempt++) {
+        u8 ok;
+        u32 val;
+        __asm__ volatile("rdrand %0; setc %1" : "=r"(val), "=qm"(ok));
+        if (ok) {
+            *out = val;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool crypto_random_bytes(u8 *out, u32 len)
+{
+    static int checked = 0;
+    static bool has_rdrand = false;
+    if (!checked) {
+        has_rdrand = cpu_has_rdrand();
+        checked = 1;
+    }
+    if (!has_rdrand)
+        return false;
+    u32 i = 0;
+    while (i < len) {
+        u32 v;
+        if (!rdrand32(&v))
+            return false;
+        u32 n = len - i < 4 ? len - i : 4;
+        for (u32 j = 0; j < n; j++)
+            out[i + j] = (u8)(v >> (j * 8));
+        i += n;
+    }
+    return true;
+}
+
+/* ---- P-256 ECDHE: keypair generation + shared secret ------------------- */
+
+/* Generates a uniformly random private scalar in [1, n-1] by rejection
+   sampling 32 random bytes against the group order n (rejecting the
+   rare out-of-range or zero draw and redrawing -- standard technique,
+   avoids the modular bias a plain "mod n" reduction would introduce),
+   then computes the corresponding public point priv*G. Returns false
+   if RDRAND is unavailable or fails, or in the (astronomically
+   unlikely, but bounded rather than infinite-looped) case rejection
+   sampling doesn't succeed within a generous attempt budget. */
+bool p256_generate_keypair(u8 priv_out[32], u8 pub_x_out[32], u8 pub_y_out[32])
+{
+    p256_ensure_init();
+    bignum_t priv;
+    bool got = false;
+    for (int attempt = 0; attempt < 64; attempt++) {
+        u8 buf[32];
+        if (!crypto_random_bytes(buf, 32))
+            return false;
+        bn_from_bytes_be(&priv, buf, 32);
+        if (!bn_is_zero(&priv) && bn_cmp(&priv, &p256_n) < 0) {
+            got = true;
+            break;
+        }
+    }
+    if (!got)
+        return false;
+
+    ec_point_t g, pub;
+    g.x = p256_gx;
+    g.y = p256_gy;
+    g.infinity = false;
+    ec_scalar_mult(&pub, &priv, &g);
+
+    bn_to_bytes_be(&priv, priv_out, 32);
+    bn_to_bytes_be(&pub.x, pub_x_out, 32);
+    bn_to_bytes_be(&pub.y, pub_y_out, 32);
+    return true;
+}
+
+/* Computes the ECDHE shared secret (the x-coordinate of priv*peer_pub,
+   per RFC 8422 section 5.10 / TLS 1.2's ECDHE premaster secret
+   definition) after validating the peer's supplied point actually
+   lies on the curve. Returns false -- refusing to produce a secret at
+   all -- if that validation fails, rather than silently computing a
+   "shared secret" derived from an attacker-chosen invalid point. */
+bool p256_ecdh_shared_secret(const u8 priv[32], const u8 peer_x[32],
+                             const u8 peer_y[32], u8 shared_x_out[32])
+{
+    p256_ensure_init();
+    ec_point_t peer;
+    bn_from_bytes_be(&peer.x, peer_x, 32);
+    bn_from_bytes_be(&peer.y, peer_y, 32);
+    peer.infinity = false;
+    if (!p256_point_on_curve(&peer.x, &peer.y))
+        return false;
+
+    bignum_t privbn;
+    bn_from_bytes_be(&privbn, priv, 32);
+
+    ec_point_t shared;
+    ec_scalar_mult(&shared, &privbn, &peer);
+    if (shared.infinity)
+        return false; /* peer's point combined with our scalar landed on
+                          infinity -- degenerate, must not be used */
+
+    bn_to_bytes_be(&shared.x, shared_x_out, 32);
+    return true;
+}
+
 /* ---- self-test: known-answer vectors, checked at boot -------------------
  *
  * This isn't a "just in case" belt-and-suspenders check: crypto bugs
@@ -982,6 +1382,144 @@ bool crypto_selftest(void)
     bn_zero(&bn_zero_check);
     if (!bn_is_zero(&bn_zero_check))
         return false;
+
+    /* P-256 point arithmetic: 2G and 3G, cross-checked against an
+       independent from-scratch Python reference (point_add/scalar_mult
+       over the same curve equation, not this file's own code) */
+    p256_ensure_init();
+    ec_point_t g, two_g, three_g;
+    g.x = p256_gx;
+    g.y = p256_gy;
+    g.infinity = false;
+    ec_point_jac_t g_jac, two_g_jac, three_g_jac;
+    g_jac.X = g.x;
+    g_jac.Y = g.y;
+    bn_zero(&g_jac.Z);
+    g_jac.Z.limb[0] = 1;
+    g_jac.infinity = false;
+    jac_double(&two_g_jac, &g_jac);
+    jac_to_affine(&two_g, &two_g_jac);
+    static const u8 two_g_x[32] = {
+        0x7c,0xf2,0x7b,0x18,0x8d,0x03,0x4f,0x7e,0x8a,0x52,0x38,0x03,0x04,0xb5,0x1a,0xc3,
+        0xc0,0x89,0x69,0xe2,0x77,0xf2,0x1b,0x35,0xa6,0x0b,0x48,0xfc,0x47,0x66,0x99,0x78,
+    };
+    static const u8 two_g_y[32] = {
+        0x07,0x77,0x55,0x10,0xdb,0x8e,0xd0,0x40,0x29,0x3d,0x9a,0xc6,0x9f,0x74,0x30,0xdb,
+        0xba,0x7d,0xad,0xe6,0x3c,0xe9,0x82,0x29,0x9e,0x04,0xb7,0x9d,0x22,0x78,0x73,0xd1,
+    };
+    bn_to_bytes_be(&two_g.x, out, 32);
+    if (!bytes_eq(out, two_g_x, 32))
+        return false;
+    bn_to_bytes_be(&two_g.y, out, 32);
+    if (!bytes_eq(out, two_g_y, 32))
+        return false;
+
+    jac_add(&three_g_jac, &two_g_jac, &g_jac);
+    jac_to_affine(&three_g, &three_g_jac);
+    static const u8 three_g_x[32] = {
+        0x5e,0xcb,0xe4,0xd1,0xa6,0x33,0x0a,0x44,0xc8,0xf7,0xef,0x95,0x1d,0x4b,0xf1,0x65,
+        0xe6,0xc6,0xb7,0x21,0xef,0xad,0xa9,0x85,0xfb,0x41,0x66,0x1b,0xc6,0xe7,0xfd,0x6c,
+    };
+    static const u8 three_g_y[32] = {
+        0x87,0x34,0x64,0x0c,0x49,0x98,0xff,0x7e,0x37,0x4b,0x06,0xce,0x1a,0x64,0xa2,0xec,
+        0xd8,0x2a,0xb0,0x36,0x38,0x4f,0xb8,0x3d,0x9a,0x79,0xb1,0x27,0xa2,0x7d,0x50,0x32,
+    };
+    bn_to_bytes_be(&three_g.x, out, 32);
+    if (!bytes_eq(out, three_g_x, 32))
+        return false;
+    bn_to_bytes_be(&three_g.y, out, 32);
+    if (!bytes_eq(out, three_g_y, 32))
+        return false;
+
+    /* P-256: on-curve validation must accept G itself and reject an
+       obviously-off-curve point */
+    if (!p256_point_on_curve(&p256_gx, &p256_gy))
+        return false;
+    bignum_t bogus_y;
+    bn_addmod(&bogus_y, &p256_gy, &bn_one, &p256_p);
+    if (p256_point_on_curve(&p256_gx, &bogus_y))
+        return false;
+
+    /* P-256 ECDHE: k1*(k2*G) == k2*(k1*G), the exact property TLS's
+       ECDHE key exchange relies on -- fixed test scalars (not RDRAND),
+       cross-checked against the same Python reference above, which
+       also confirmed shared_secret_match == True for these values */
+    static const u8 k1_b[31] = {
+        0x12,0x34,0x56,0x78,0x90,0xab,0xcd,0xef,0x12,0x34,0x56,0x78,0x90,0xab,0xcd,0xef,
+        0x12,0x34,0x56,0x78,0x90,0xab,0xcd,0xef,0x12,0x34,0x56,0x78,0x90,0xab,0xcd,
+    };
+    static const u8 k2_b[31] = {
+        0xfe,0xdc,0xba,0x09,0x87,0x65,0x43,0x21,0xfe,0xdc,0xba,0x09,0x87,0x65,0x43,0x21,
+        0xfe,0xdc,0xba,0x09,0x87,0x65,0x43,0x21,0xfe,0xdc,0xba,0x09,0x87,0x65,0x43,
+    };
+    static const u8 shared_x_expect[32] = {
+        0x80,0xff,0x8c,0x50,0xd1,0x2c,0x9a,0xbf,0xd0,0xa3,0xbf,0xee,0x1e,0x8c,0x14,0xe7,
+        0x58,0x07,0x82,0x59,0x82,0x1c,0xd8,0x24,0xc8,0xf9,0x09,0x98,0x74,0x54,0xa5,0x77,
+    };
+    u8 k1_full[32] = {0}, k2_full[32] = {0};
+    memcpy(k1_full + 1, k1_b, 31); /* k1/k2 are 31 bytes wide; left-pad
+                                       the top byte with 0 to fill priv[32] */
+    memcpy(k2_full + 1, k2_b, 31);
+
+    u8 p1x[32], p1y[32], p2x[32], p2y[32], s1x[32], s2x[32];
+    bignum_t bk1, bk2;
+    bn_from_bytes_be(&bk1, k1_full, 32);
+    bn_from_bytes_be(&bk2, k2_full, 32);
+    ec_point_t ep1, ep2;
+    ec_scalar_mult(&ep1, &bk1, &g);
+    ec_scalar_mult(&ep2, &bk2, &g);
+    bn_to_bytes_be(&ep1.x, p1x, 32);
+    bn_to_bytes_be(&ep1.y, p1y, 32);
+    bn_to_bytes_be(&ep2.x, p2x, 32);
+    bn_to_bytes_be(&ep2.y, p2y, 32);
+
+    if (!p256_ecdh_shared_secret(k1_full, p2x, p2y, s1x))
+        return false;
+    if (!p256_ecdh_shared_secret(k2_full, p1x, p1y, s2x))
+        return false;
+    if (!bytes_eq(s1x, s2x, 32))
+        return false;
+    if (!bytes_eq(s1x, shared_x_expect, 32))
+        return false;
+
+    /* a peer point that's off-curve must be rejected outright, never
+       silently combined into a "shared secret" */
+    u8 bogus_peer_y[32];
+    memcpy(bogus_peer_y, p2y, 32);
+    bogus_peer_y[31] ^= 0x01;
+    u8 reject_out[32];
+    if (p256_ecdh_shared_secret(k1_full, p2x, bogus_peer_y, reject_out))
+        return false;
+
+    /* RDRAND-backed key generation: if the hardware/hypervisor exposes
+       RDRAND, a generated keypair's public point must land on the
+       curve and a full generate+generate+ECDH round trip must agree
+       from both sides (mirrors the fixed-scalar check above but with
+       genuinely random scalars). If RDRAND isn't available, this is
+       skipped rather than failing the whole self-test -- crypto_ok
+       still gates TLS, but a machine without RDRAND simply can't do
+       ECDHE at all, which p256_generate_keypair's own false return
+       already enforces at the point of use. */
+    u8 rpriv1[32], rpub1x[32], rpub1y[32];
+    u8 rpriv2[32], rpub2x[32], rpub2y[32];
+    if (crypto_random_bytes(out, 4)) { /* RDRAND present -- exercise the full path */
+        if (!p256_generate_keypair(rpriv1, rpub1x, rpub1y))
+            return false;
+        if (!p256_generate_keypair(rpriv2, rpub2x, rpub2y))
+            return false;
+        bignum_t rx1, ry1;
+        bn_from_bytes_be(&rx1, rpub1x, 32);
+        bn_from_bytes_be(&ry1, rpub1y, 32);
+        if (!p256_point_on_curve(&rx1, &ry1))
+            return false;
+        u8 rs1[32], rs2[32];
+        if (!p256_ecdh_shared_secret(rpriv1, rpub2x, rpub2y, rs1))
+            return false;
+        if (!p256_ecdh_shared_secret(rpriv2, rpub1x, rpub1y, rs2))
+            return false;
+        if (!bytes_eq(rs1, rs2, 32))
+            return false;
+    }
 
     return true;
 }

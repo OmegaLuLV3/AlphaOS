@@ -162,6 +162,7 @@ $(BUILD)/alphaos.iso: $(BUILD)/kernel.elf $(BUILD)/initrd.img boot/grub.cfg
 # gateway 10.0.2.2). `ping` at the shell exercises the whole stack.
 
 QEMU := qemu-system-x86_64 -m 128 -vga std -cdrom $(BUILD)/alphaos.iso \
+        -cpu qemu64,+rdrand \
         -netdev user,id=net0 -device rtl8139,netdev=net0
 
 run: all

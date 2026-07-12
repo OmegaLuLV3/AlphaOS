@@ -66,6 +66,7 @@ feed() {
 # Makefile's $(QEMU) — explicit, not relying on QEMU's own default NIC.
 feed | timeout 120 qemu-system-x86_64 -m 128 -vga std \
     -cdrom "$BUILD/alphaos.iso" \
+    -cpu qemu64,+rdrand \
     -netdev user,id=net0 -device rtl8139,netdev=net0 \
     -nographic -no-reboot | tee "$LOG"
 

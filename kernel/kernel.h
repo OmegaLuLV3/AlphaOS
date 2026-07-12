@@ -169,6 +169,14 @@ void bn_mulmod(bignum_t *r, const bignum_t *a, const bignum_t *b,
 void bn_modexp(bignum_t *r, const bignum_t *base, const bignum_t *exp,
               const bignum_t *n);
 void bn_modinv_prime(bignum_t *r, const bignum_t *a, const bignum_t *p);
+void bn_submod(bignum_t *r, const bignum_t *a, const bignum_t *b, const bignum_t *p);
+void bn_addmod(bignum_t *r, const bignum_t *a, const bignum_t *b, const bignum_t *p);
+
+/* ---- crypto.c: P-256 ECDHE (RDRAND-seeded) ---------------------------- */
+bool crypto_random_bytes(u8 *out, u32 len);
+bool p256_generate_keypair(u8 priv_out[32], u8 pub_x_out[32], u8 pub_y_out[32]);
+bool p256_ecdh_shared_secret(const u8 priv[32], const u8 peer_x[32],
+                             const u8 peer_y[32], u8 shared_x_out[32]);
 
 bool crypto_selftest(void);
 extern bool crypto_ok; /* set once at boot; TLS code must check this
