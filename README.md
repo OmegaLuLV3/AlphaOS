@@ -257,6 +257,16 @@ still starts in 32-bit protected mode either way; only QEMU's built-in
 loader is picky about the ELF class). `make` builds `build/alphaos.iso`
 via `grub-mkrescue`; `make run`/`run-vga`/`test` boot it with `-cdrom`.
 
+**Running it on Android:** build normally on a desktop (`make`), copy
+`build/alphaos.iso` and `build/disk.img` onto the phone, install
+Termux + `pkg install qemu-system-x86-64 mtools`, then run
+`tools/termux_run.sh /path/to/alphaos.iso /path/to/disk.img` — same
+headless serial-console boot as `make run`, right in the Termux
+terminal. It's QEMU's software (TCG) x86-64 emulation, not hardware
+acceleration (no KVM for x86-on-ARM), so it'll feel slower than on a
+desktop, but otherwise behaves identically — the disk image persists
+whatever you `write` to it across runs, same as everywhere else.
+
 ## Shell commands
 
 | command | description |
